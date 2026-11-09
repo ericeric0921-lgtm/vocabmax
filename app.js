@@ -102,9 +102,9 @@ const LOGO = '<svg class="logo" viewBox="0 0 512 512"><rect width="512" height="
 /* ---------- 資料與儲存 ---------- */
 const LANGS = [['auto', '自動偵測'], ['en-US', '英文'], ['zh-TW', '中文（繁體）'], ['zh-CN', '中文（簡體）'], ['ja-JP', '日文'], ['ko-KR', '韓文'], ['fr-FR', '法文'], ['de-DE', '德文'], ['es-ES', '西班牙文'], ['it-IT', '義大利文'], ['pt-BR', '葡萄牙文'], ['ru-RU', '俄文'], ['vi-VN', '越南文'], ['th-TH', '泰文'], ['id-ID', '印尼文']];
 const langOpts = v => LANGS.map(([k, l]) => `<option value="${k}" ${k === v ? 'selected' : ''}>${l}</option>`).join('');
-const DEF_SETTINGS = { theme: 'auto', retention: 0.9, newPerDay: 20, maxReviews: 200, learnSteps: [1, 10], relearnSteps: [10], maxIvl: 36500, srsFront: 'term', ttsRate: 1, autoSpeak: false, sort: 'orig' };
+const DEF_SETTINGS = { theme: 'auto', retention: 0.9, newPerDay: 20, maxReviews: 200, learnSteps: [1, 10], relearnSteps: [10], maxIvl: 36500, srsFront: 'term', ttsRate: 1, autoSpeak: false, sort: 'orig', srsMode: 'self', srsCloze: true, leech: 8, dailyGoal: 30, remindHour: -1, fsrsW: null };
 let S = null;
-const blank = () => ({ id: uid(), term: '', def: '', img: '', star: false, lv: 0, srs: null });
+const blank = () => ({ id: uid(), term: '', def: '', ex: '', note: '', img: '', star: false, lv: 0, srs: null });
 
 const DB = {
   db: null,
@@ -117,11 +117,12 @@ function migrate(s) {
   s.v = 1;
   s.settings = { ...DEF_SETTINGS, ...(s.settings || {}) };
   s.sets = s.sets || {}; s.folders = s.folders || {}; s.log = s.log || {}; s.best = s.best || {};
+  s.meta = { lastBackup: 0, snooze: 0, ...(s.meta || {}) };
   for (const [id, set] of Object.entries(s.sets)) {
     set.id = set.id || id; set.title = set.title || '未命名學習集'; set.desc = set.desc || '';
     set.termLang = set.termLang || 'auto'; set.defLang = set.defLang || 'auto';
     set.created = set.created || Date.now(); set.updated = set.updated || set.created;
-    set.cards = (set.cards || []).map(c => ({ id: c.id || uid(), term: String(c.term ?? ''), def: String(c.def ?? ''), img: c.img || '', star: !!c.star, lv: c.lv || 0, srs: c.srs || null, bury: c.bury }));
+    set.cards = (set.cards || []).map(c => ({ ...c, id: c.id || uid(), term: String(c.term ?? ''), def: String(c.def ?? ''), ex: String(c.ex ?? ''), note: String(c.note ?? ''), img: c.img || '', star: !!c.star, lv: c.lv || 0, srs: c.srs || null }));
   }
   for (const [id, f] of Object.entries(s.folders)) { f.id = f.id || id; f.name = f.name || '資料夾'; f.setIds = (f.setIds || []).filter(x => s.sets[x]); }
   return s;
@@ -143,6 +144,20 @@ async function persist() {
     try { localStorage.setItem('vocabmax', JSON.stringify(S)); } catch (e2) { toast('⚠️ 儲存失敗：空間可能不足'); }
   }
 }
+/* 自動快照：每天最多一份，保留最近 3 份（只在這台裝置，防止誤刪／誤覆蓋） */
+async function takeSnapshot(force) {
+  if (!DB.db || !S || !Object.keys(S.sets).length) return;
+  try {
+    let snaps = (await DB.get('snaps')) || [];
+    if (!force && snaps[0] && Date.now() - snaps[0].t < DAY * 0.9) return;
+    const copy = JSON.parse(JSON.stringify(S)); delete copy.draft;
+    snaps.unshift({ t: Date.now(), n: Object.keys(S.sets).length, c: Object.values(S.sets).reduce((n, s) => n + s.cards.length, 0), data: copy });
+    await DB.set('snaps', snaps.slice(0, 3));
+  } catch (e) { }
+}
+async function listSnapshots() { try { return DB.db ? ((await DB.get('snaps')) || []) : []; } catch (e) { return []; } }
+function markBackup() { S.meta.lastBackup = Date.now(); S.meta.snooze = 0; save(); }
+const ago = t => { if (!t) return '從未'; const d = Math.floor((Date.now() - t) / DAY); return d <= 0 ? '今天' : d + ' 天前'; };
 function seed() {
   const words = [['abundant', '豐富的；充足的'], ['benevolent', '仁慈的；善意的'], ['candid', '坦率的；直言的'], ['diligent', '勤奮的'], ['eloquent', '有口才的；雄辯的'], ['frugal', '節儉的'], ['gregarious', '愛交際的；群居的'], ['hypothesis', '假設；假說'], ['inevitable', '不可避免的'], ['meticulous', '一絲不苟的；極仔細的'], ['notorious', '惡名昭彰的'], ['pragmatic', '務實的']];
   const id = uid();
@@ -152,7 +167,22 @@ const setsArr = () => Object.values(S.sets).sort((a, b) => (b.opened || b.update
 const usable = set => set.cards.filter(c => c.term.trim() && c.def.trim());
 function setStats(set) { let ns = 0, lr = 0, ms = 0; for (const c of set.cards) { if (c.lv >= 3) ms++; else if (c.lv > 0) lr++; else ns++; } return { ns, lr, ms }; }
 function logDay(k = dayKey()) { return S.log[k] || (S.log[k] = { n: 0, new: 0, rev: 0, pass: 0, fail: 0, extra: 0 }); }
-function act(n = 1) { logDay().n += n; save(); }
+function act(n = 1) { logDay().n += n; checkGoal(); save(); }
+function checkGoal() {
+  const L = logDay(), g = S.settings.dailyGoal;
+  if (g > 0 && !L.goal && L.n >= g) { L.goal = 1; celebrate(); toast(`🎯 今日目標 ${g} 次達成！`); }
+}
+function celebrate() {
+  const colors = ['#4255ff', '#ffcd1f', '#18ae79', '#ff725b', '#a8b1ff'], box = document.createElement('div');
+  box.className = 'confetti';
+  for (let i = 0; i < 46; i++) {
+    const p = document.createElement('i');
+    p.style.cssText = `left:${Math.random() * 100}%;background:${pick(colors)};animation-delay:${Math.random() * .4}s;animation-duration:${1.4 + Math.random() * 1.2}s;--dx:${(Math.random() - .5) * 160}px;--rot:${Math.random() * 720}deg`;
+    box.appendChild(p);
+  }
+  document.body.appendChild(box);
+  setTimeout(() => box.remove(), 3200);
+}
 function calcStreak() {
   let s = 0, t = Date.now();
   if (!(S.log[dayKey(t)] && S.log[dayKey(t)].n)) t -= DAY;
@@ -192,7 +222,9 @@ const TTS = {
 
 /* ---------- FSRS-5 間隔重複演算法 ---------- */
 const FSRS = (() => {
-  const W = [0.40255, 1.18385, 3.173, 15.69105, 7.1949, 0.5345, 1.4604, 0.0046, 1.54575, 0.1192, 1.01925, 1.9395, 0.11, 0.29605, 2.2698, 0.2315, 2.9898, 0.51655, 0.6621];
+  const DEF = [0.40255, 1.18385, 3.173, 15.69105, 7.1949, 0.5345, 1.4604, 0.0046, 1.54575, 0.1192, 1.01925, 1.9395, 0.11, 0.29605, 2.2698, 0.2315, 2.9898, 0.51655, 0.6621];
+  const CL = [[0.001, 100], [0.001, 100], [0.001, 100], [0.001, 100], [1, 10], [0.001, 4], [0.001, 4], [0.001, 0.75], [0, 4.5], [0, 0.8], [0.001, 3.5], [0.001, 5], [0.001, 0.25], [0.001, 0.9], [0, 4], [0, 1], [1, 6], [0, 2], [0, 2]];
+  let W = [...DEF];
   const DECAY = -0.5, FACTOR = 19 / 81;
   const cD = d => clamp(d, 1, 10);
   const initS = g => Math.max(W[g - 1], 0.1);
@@ -245,29 +277,128 @@ const FSRS = (() => {
     return c;
   }
   const retr = (q, now = Date.now()) => q && q.state ? R(Math.max(0, (now - q.last) / DAY), q.s) : 0;
-  return { next, retr };
+
+  const setW = w => { W = Array.isArray(w) && w.length === 19 && w.every(Number.isFinite) ? w.map((v, i) => clamp(v, CL[i][0], CL[i][1])) : [...DEF]; };
+
+  /** 依複習日誌重播，計算「預測記得機率 vs 實際結果」的 log loss。groups: 每張卡每個方向的 [時間, 評分, 評分前狀態] 序列 */
+  function replay(groups, w) {
+    const keep = W; W = w; let loss = 0, n = 0;
+    try {
+      for (const logs of groups) {
+        let s = 0, d = 0, last = 0;
+        for (const [t, g, s0] of logs) {
+          const el = last ? Math.max(0, (t - last) / DAY) : 0;
+          if (!s0 || !s) { s = initS(g); d = initD(g); }
+          else {
+            if (s0 === 2 || el >= 1) {
+              const r = R(el, s);
+              if (el >= 1) { const p = clamp(r, 1e-4, 1 - 1e-4); loss -= g > 1 ? Math.log(p) : Math.log(1 - p); n++; }
+              s = g === 1 ? forgetS(d, s, r) : recallS(d, s, r, g);
+            } else s = shortS(s, g);
+            d = nextD(d, g);
+          }
+          s = Math.max(0.01, s);
+          last = t;
+        }
+      }
+    } finally { W = keep; }
+    return { loss: n ? loss / n : 0, n };
+  }
+  /** 以座標搜尋（含向預設值收斂的正則化）個人化參數 */
+  async function optimize(groups, onProgress) {
+    const base = replay(groups, W), n = base.n, lam = 0.02 * 30 / (n + 30);
+    const reg = w => { let s = 0; for (let i = 0; i < 19; i++) { const z = (w[i] - DEF[i]) / (Math.abs(DEF[i]) + 0.3); s += z * z; } return lam * s; };
+    const cost = w => replay(groups, w).loss + reg(w);
+    let best = [...W], bc = cost(best);
+    const fr = [0.2, 0.1, 0.05, 0.025, 0.0125];
+    for (let f = 0; f < fr.length; f++) {
+      for (let i = 0; i < 19; i++) {
+        const range = CL[i][1] - CL[i][0], step = Math.min(range * fr[f], Math.max(Math.abs(best[i]) * 0.5, 0.02));
+        for (let rep = 0; rep < 3; rep++) {
+          let moved = false;
+          for (const sgn of [1, -1]) {
+            const cand = [...best]; cand[i] = clamp(cand[i] + sgn * step, CL[i][0], CL[i][1]);
+            if (cand[i] === best[i]) continue;
+            const cc = cost(cand);
+            if (cc < bc - 1e-7) { best = cand; bc = cc; moved = true; break; }
+          }
+          if (!moved) break;
+        }
+        if (i % 4 === 3) { onProgress && onProgress((f * 19 + i + 1) / (fr.length * 19)); await new Promise(r => setTimeout(r, 0)); }
+      }
+    }
+    const after = replay(groups, best);
+    return { w: best, before: base.loss, after: after.loss, n };
+  }
+  return { next, retr, setW, getW: () => [...W], DEF, replay, optimize };
 })();
 
+/* ---------- 例句填空 ---------- */
+const escRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function cloze(c) {
+  if (!c.ex || !c.term || !c.term.trim()) return null;
+  const base = c.term.trim().split(/[;,，、/；|\n]/)[0].replace(/[(（\[【].*$/, '').trim();
+  if (!base) return null;
+  const BLANK = '＿＿＿＿';
+  if (/[぀-鿿가-힯]/.test(base)) {
+    const i = c.ex.toLowerCase().indexOf(base.toLowerCase());
+    if (i < 0) return null;
+    return { text: c.ex.slice(0, i) + BLANK + c.ex.slice(i + base.length), surface: c.ex.slice(i, i + base.length) };
+  }
+  const re = new RegExp('(^|[^\\p{L}\\p{N}])(' + escRe(base) + '[a-zA-Z\\u00C0-\\u024F]*)', 'iu');
+  const m = c.ex.match(re);
+  if (!m) return null;
+  const reG = new RegExp(re.source, 'giu');
+  return { text: c.ex.replace(reG, (a, p) => p + BLANK), surface: m[2] };
+}
+const checkCl = (input, Q) => { let r = check(input, Q.a); if (!r.ok && Q.alt) { const r2 = check(input, Q.alt); if (r2.ok) r = r2; } return r; };
+const clozeQ = c => { const z = cloze(c); return z ? { q: z.text, a: c.term, alt: z.surface, qLabel: '例句填空', aLabel: '詞語', qImg: '', qLang: 'auto', aLang: 'auto' } : null; };
+
+/* ---------- 排程資料集（每張卡最多兩個方向：正向 srs、反向 srs2） ---------- */
 function poolFor(scope) {
   let sets;
-  if (scope === 'all') sets = Object.values(S.sets);
+  if (scope === 'all' || scope === 'leech') sets = Object.values(S.sets);
   else if (scope.startsWith('s:')) sets = [S.sets[scope.slice(2)]].filter(Boolean);
   else { const f = S.folders[scope.slice(2)]; sets = f ? f.setIds.map(id => S.sets[id]).filter(Boolean) : []; }
-  const out = [];
   sets = sets.filter(s => s.srs !== false); // 未加入間隔重複的學習集不參與
-  for (const s of sets) for (const c of s.cards) if (c.term.trim() || c.def.trim() || c.img) out.push({ s, c });
-  return out;
+  const out = [];
+  for (const s of sets) for (const c of s.cards) {
+    if (!(c.term.trim() || c.def.trim() || c.img)) continue;
+    out.push({ s, c, k: 'f', key: 'srs' });
+    if (s.bidi && c.term.trim() && (c.def.trim() || c.img)) out.push({ s, c, k: 'r', key: 'srs2' });
+  }
+  return scope === 'leech' ? out.filter(x => { const q = x.c[x.key]; return q && q.leech && !q.susp; }) : out;
+}
+function leechList() {
+  const out = [];
+  for (const s of Object.values(S.sets)) {
+    if (s.srs === false) continue;
+    for (const c of s.cards) for (const [k, key] of [['f', 'srs'], ['r', 'srs2']]) {
+      if (k === 'r' && !s.bidi) continue;
+      const q = c[key]; if (q && q.leech) out.push({ s, c, k, key });
+    }
+  }
+  return out.sort((a, b) => (b.c[b.key].lapses || 0) - (a.c[a.key].lapses || 0));
 }
 function srsLimits() { const L = logDay(); return { newLeft: Math.max(0, S.settings.newPerDay + (L.extra || 0) - L.new), revLeft: Math.max(0, S.settings.maxReviews - L.rev) }; }
-function srsCounts(scope, now = Date.now()) {
-  const end = dayEnd(now), today = dayKey(now); let n = 0, l = 0, r = 0;
-  for (const { c } of poolFor(scope)) {
-    if (c.bury === today) continue;
-    const q = c.srs;
-    if (!q || !q.state) n++; else if (q.state === 2) { if (q.due < end) r++; } else if (q.due < end) l++;
+const sibBuried = (x, today) => !!(x.c.sib && x.c.sib.d === today && x.c.sib.k === x.k);
+function buckets(scope, now = Date.now()) {
+  const end = dayEnd(now), today = dayKey(now);
+  const b = { nw: [], ld: [], la: [], lt: [], rv: [] };
+  for (const x of poolFor(scope)) {
+    const q = x.c[x.key];
+    if (x.c.bury === today || (q && q.susp)) continue;
+    if (!q || !q.state) { if (!sibBuried(x, today)) b.nw.push(x); }
+    else if (q.state === 2) { if (q.due < end && !sibBuried(x, today)) b.rv.push(x); }
+    else if (q.due <= now) b.ld.push(x);
+    else if (q.due <= now + 20 * MIN) b.la.push(x);
+    else if (q.due < end) b.lt.push(x);
   }
-  const { newLeft, revLeft } = srsLimits();
-  const out = { new: Math.min(n, newLeft), learn: l, rev: Math.min(r, revLeft) };
+  return b;
+}
+function srsCounts(scope, now = Date.now()) {
+  const b = buckets(scope, now), { newLeft, revLeft } = srsLimits();
+  const out = { new: Math.min(b.nw.length, newLeft), learn: b.ld.length + b.la.length + b.lt.length, rev: Math.min(b.rv.length, revLeft) };
   out.total = out.new + out.learn + out.rev;
   return out;
 }
@@ -378,11 +509,12 @@ async function shareOrDownload(text, name, type = 'text/plain') {
   const blob = new Blob([text], { type });
   try {
     const file = new File([blob], name, { type });
-    if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: name }); return; }
-  } catch (e) { if (e && e.name === 'AbortError') return; }
+    if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: name }); return true; }
+  } catch (e) { if (e && e.name === 'AbortError') return false; }
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  return true;
 }
 async function copyText(t) {
   try { await navigator.clipboard.writeText(t); toast('已複製到剪貼簿'); }
@@ -421,7 +553,14 @@ function scrHome() {
   let total = 0, mastered = 0;
   for (const s of sets) for (const x of s.cards) { total++; if (x.lv >= 3) mastered++; }
   const folders = Object.values(S.folders);
+  const goal = S.settings.dailyGoal, rem = S.settings.remindHour, hr = new Date().getHours(), pct = goal > 0 ? Math.min(100, L.n / goal * 100) : 0;
+  const goalHTML = goal > 0 ? `<section class="panel goal mt"><div class="row"><b class="grow">今日目標</b><span class="muted sm">${Math.min(L.n, goal)} / ${goal} 次作答</span></div><div class="bar ${L.n >= goal ? 'ok' : ''}" style="margin-top:8px;flex:none"><i style="width:${pct}%"></i></div>${L.n >= goal ? '<p class="sm ok-t" style="margin:8px 0 0">✅ 今天的目標達成了！</p>' : rem >= 0 && hr >= rem ? `<p class="sm" style="margin:8px 0 0;color:var(--warn)">⏰ 還差 ${goal - L.n} 次，今天加油！</p>` : ''}</section>` : '';
+  const leechN = leechList().filter(x => !x.c[x.key].susp).length;
+  const age = S.meta.lastBackup ? (Date.now() - S.meta.lastBackup) / DAY : Infinity;
+  const needBk = total > 0 && age >= 7 && Date.now() >= (S.meta.snooze || 0);
+  const bkHTML = needBk ? `<section class="panel warnb"><b>🛟 記得備份你的資料</b><p class="sm muted" style="margin:4px 0 10px">資料只存在這支手機裡。${S.meta.lastBackup ? `上次備份是 ${ago(S.meta.lastBackup)}。` : '你還沒有備份過。'}建議存到「檔案」或 iCloud。</p><div class="row gap"><button class="btn primary sm" data-a="bk">立即備份</button><button class="btn ghost sm" data-a="snz">3 天後再提醒</button></div></section>` : '';
   render(`<div class="page">
+    ${bkHTML}
     <header class="home-head"><div class="brand">${LOGO}<span>VocabMax</span></div><a class="streak-chip" href="#/stats" aria-label="連續學習天數">${ic('flame')}<b>${streak}</b></a></header>
     <section class="panel today">
       <div class="today-main">
@@ -431,6 +570,8 @@ function scrHome() {
       </div>
       <a class="btn primary" href="#/review">${c.total ? '開始' : '查看'}</a>
     </section>
+    ${goalHTML}
+    ${leechN ? `<a class="panel row mt" href="#/leeches" style="justify-content:space-between"><span>⚠️ <b>頑固卡</b> <span class="muted sm">反覆忘記的卡片</span></span><span class="pill blue">${leechN} 張 ›</span></a>` : ''}
     <div class="stat-row">
       <a class="stat" href="#/stats"><b>${L.n}</b><span>今日作答</span></a>
       <a class="stat" href="#/stats"><b>${total}</b><span>總詞語</span></a>
@@ -440,6 +581,15 @@ function scrHome() {
     ${sets.length ? `<div class="tiles">${sets.slice(0, 6).map(s => setTile(s)).join('')}</div>` : `<div class="empty">${ic('cards')}<p>還沒有學習集，建立第一個吧！</p><a class="btn primary" href="#/create">${ic('plus')} 建立學習集</a></div>`}
     ${folders.length ? `<div class="sec-head"><h2>資料夾</h2></div><div class="tiles">${folders.map(folderTile).join('')}</div>` : ''}
   </div>`);
+  H = {
+    bk: async () => { if (await doBackup()) scrHome(); },
+    snz: () => { S.meta.snooze = Date.now() + 3 * DAY; save(); scrHome(); },
+  };
+}
+async function doBackup() {
+  const ok = await shareOrDownload(JSON.stringify({ ...S, draft: undefined }), `vocabmax-backup-${dayKey()}.json`, 'application/json');
+  if (ok) { markBackup(); toast('已備份，請確認檔案已存到「檔案」或 iCloud'); }
+  return ok;
 }
 
 /* ---------- 資料庫 ---------- */
@@ -510,7 +660,8 @@ function scrSet(id) {
   const set = S.sets[id]; if (!set) return go('#/library');
   set.opened = Date.now(); save();
   const st = setStats(set), n = set.cards.length, sc = srsCounts('s:' + id);
-  let reviewed = 0; for (const c of set.cards) if (c.srs && c.srs.state) reviewed++;
+  let reviewed = 0; for (const c of set.cards) { if (c.srs && c.srs.state) reviewed++; if (set.bidi && c.srs2 && c.srs2.state) reviewed++; }
+  const slots = n * (set.bidi ? 2 : 1);
   const pv = { i: 0 };
   render(`<div class="page">
     <div class="topbar"><a class="icon-btn" href="#/library" aria-label="返回">${ic('back')}</a><div class="grow"></div><button class="icon-btn" data-a="export" aria-label="匯出">${ic('upload')}</button><button class="icon-btn" data-a="more" aria-label="更多">${ic('more')}</button></div>
@@ -525,8 +676,8 @@ function scrSet(id) {
         <div class="prog-row lv1"><span>學習中</span><div class="bar"><i style="width:${n ? st.lr / n * 100 : 0}%"></i></div><b>${st.lr}</b></div>
         <div class="prog-row lv3"><span>已精通</span><div class="bar"><i style="width:${n ? st.ms / n * 100 : 0}%"></i></div><b>${st.ms}</b></div>
       </div>
-      <div style="margin-top:8px">${swRow('加入記憶複習（間隔重複）', 'srs', set.srs !== false, '關閉後，這個學習集不會出現在待複習清單', 'ss')}</div>
-      ${set.srs !== false ? `<div class="srs-line srs-counts"><span class="muted" style="padding-left:0">記憶複習：</span><span class="cn-new">${sc.new} 新卡</span><span class="cn-learn">${sc.learn} 學習中</span><span class="cn-rev">${sc.rev} 到期</span><span class="muted">· 已排程 ${reviewed}/${n}</span></div>` : ''}
+      <div style="margin-top:8px">${swRow('加入記憶複習（間隔重複）', 'srs', set.srs !== false, '關閉後，這個學習集不會出現在待複習清單', 'ss')}${set.srs !== false ? swRow('雙向卡片', 'bidi', !!set.bidi, '同時複習「詞語→定義」與「定義→詞語」，各自獨立排程', 'sb') : ''}</div>
+      ${set.srs !== false ? `<div class="srs-line srs-counts"><span class="muted" style="padding-left:0">記憶複習：</span><span class="cn-new">${sc.new} 新卡</span><span class="cn-learn">${sc.learn} 學習中</span><span class="cn-rev">${sc.rev} 到期</span><span class="muted">· 已排程 ${reviewed}/${slots}</span></div>` : ''}
     </section>
     <div class="sec-head"><h2>本學習集中的詞語（${n}）</h2><select class="input sm" id="sort"><option value="orig">原始順序</option><option value="alpha">字母順序</option><option value="lv">依熟練度</option><option value="star">星號優先</option></select></div>
     <div id="terms" class="terms"></div>
@@ -540,7 +691,7 @@ function scrSet(id) {
     el.innerHTML = `<div class="fc mini" data-a="pvflip"><div class="fc-inner"><div class="face front"><div class="fc-text ${sz(c.term)}">${fmt(c.term)}</div></div><div class="face back">${c.img ? `<img class="fc-img" src="${c.img}" alt="">` : ''}<div class="fc-text ${sz(c.def)}">${fmt(c.def)}</div></div></div></div>
       <div class="pv-nav"><button class="icon-btn round" data-a="pvprev" ${pv.i ? '' : 'disabled'}>${ic('left')}</button><span>${pv.i + 1} / ${n}</span><button class="icon-btn round" data-a="pvnext" ${pv.i < n - 1 ? '' : 'disabled'}>${ic('right')}</button><a class="icon-btn expand" href="#/s/${id}/flashcards" aria-label="全螢幕">${ic('expand')}</a></div>`;
   }
-  const row = c => `<div class="term-row lv${c.lv >= 3 ? 3 : c.lv > 0 ? 1 : 0}"><div class="tr-t" data-a="sayT" data-id="${c.id}">${fmt(c.term)}</div><div class="tr-d" data-a="sayD" data-id="${c.id}">${c.img ? `<img src="${c.img}" alt="">` : ''}<span>${fmt(c.def)}</span></div><div class="tr-a"><button class="icon-btn sm star ${c.star ? 'on' : ''}" data-a="star" data-id="${c.id}" aria-label="星號">${ic('star')}</button><button class="icon-btn sm" data-a="sayT" data-id="${c.id}" aria-label="朗讀">${ic('sound')}</button></div></div>`;
+  const row = c => `<div class="term-row lv${c.lv >= 3 ? 3 : c.lv > 0 ? 1 : 0}"><div class="tr-t" data-a="sayT" data-id="${c.id}">${fmt(c.term)}</div><div class="tr-d" data-a="sayD" data-id="${c.id}">${c.img ? `<img src="${c.img}" alt="">` : ''}<span>${fmt(c.def)}</span>${c.ex ? `<div class="tr-ex">${fmt(c.ex)}</div>` : ''}${c.note ? `<div class="tr-ex">📝 ${fmt(c.note)}</div>` : ''}</div><div class="tr-a"><button class="icon-btn sm star ${c.star ? 'on' : ''}" data-a="star" data-id="${c.id}" aria-label="星號">${ic('star')}</button><button class="icon-btn sm" data-a="sayT" data-id="${c.id}" aria-label="朗讀">${ic('sound')}</button></div></div>`;
   function drawTerms() {
     const so = S.settings.sort; let cs = [...set.cards], html;
     if (so === 'alpha') cs.sort((a, b) => a.term.localeCompare(b.term, undefined, { sensitivity: 'base' }));
@@ -562,16 +713,17 @@ function scrSet(id) {
     $change: e => {
       if (e.target.id === 'sort') { S.settings.sort = e.target.value; save(); drawTerms(); }
       else if (e.target.dataset.ss) { set.srs = e.target.checked; save(); toast(set.srs ? '已加入記憶複習' : '已從記憶複習移除'); scrSet(id); }
+      else if (e.target.dataset.sb) { set.bidi = e.target.checked; save(); toast(set.bidi ? '已開啟雙向卡片：反向卡片會以新卡加入' : '已關閉雙向卡片'); scrSet(id); }
     },
     export: () => exportSet(set),
     more: () => menuSheet(set.title, [
       ['edit', '編輯學習集', () => go('#/edit/' + id)],
       ['folder', '加入資料夾', () => folderPicker(set)],
-      ['copy', '複製學習集', () => { const cp = JSON.parse(JSON.stringify(set)); cp.id = uid(); cp.title += '（副本）'; cp.created = cp.updated = Date.now(); delete cp.opened; delete cp.fc; cp.cards.forEach(c => { c.id = uid(); c.lv = 0; c.srs = null; delete c.bury; }); S.sets[cp.id] = cp; save(); toast('已建立副本'); go('#/set/' + cp.id); }],
+      ['copy', '複製學習集', () => { const cp = JSON.parse(JSON.stringify(set)); cp.id = uid(); cp.title += '（副本）'; cp.created = cp.updated = Date.now(); delete cp.opened; delete cp.fc; cp.cards.forEach(c => { c.id = uid(); c.lv = 0; c.srs = null; delete c.srs2; delete c.rl; delete c.sib; delete c.bury; }); S.sets[cp.id] = cp; save(); toast('已建立副本'); go('#/set/' + cp.id); }],
       ['upload', '匯出 / 分享', () => exportSet(set)],
       ['swap', '互換所有詞語與定義', async () => { if (await confirmDlg('互換所有詞語與定義？', { sub: '語言設定也會一起互換。' })) { set.cards.forEach(c => { [c.term, c.def] = [c.def, c.term]; }); [set.termLang, set.defLang] = [set.defLang, set.termLang]; set.updated = Date.now(); save(); scrSet(id); } }],
       ['reset', '重設學習進度（未學習/學習中/已精通）', async () => { if (await confirmDlg('重設學習進度？', { danger: true, ok: '重設' })) { set.cards.forEach(c => c.lv = 0); set.fc = null; save(); scrSet(id); } }],
-      ['review', '重設記憶複習排程', async () => { if (await confirmDlg('重設這個學習集的 FSRS 排程？', { danger: true, ok: '重設', sub: '所有卡片會變回新卡。' })) { set.cards.forEach(c => { c.srs = null; delete c.bury; }); save(); scrSet(id); } }],
+      ['review', '重設記憶複習排程', async () => { if (await confirmDlg('重設這個學習集的 FSRS 排程？', { danger: true, ok: '重設', sub: '所有卡片會變回新卡。' })) { set.cards.forEach(c => { c.srs = null; delete c.srs2; delete c.sib; delete c.bury; }); save(); scrSet(id); } }],
       ['trash', '刪除學習集', async () => { if (await confirmDlg(`刪除「${set.title}」？`, { danger: true, ok: '刪除', sub: '此動作無法復原。' })) { delete S.sets[id]; Object.values(S.folders).forEach(f => f.setIds = f.setIds.filter(x => x !== id)); save(); toast('已刪除'); go('#/library'); } }, true],
     ]),
   };
@@ -613,12 +765,13 @@ function scrEdit(id) {
     <input class="input title-in" data-f="title" placeholder="輸入標題，例如「多益核心單字」" value="${esc(d.title)}">
     <textarea class="input" data-f="desc" rows="2" placeholder="新增描述…">${esc(d.desc)}</textarea>
     <div class="row gap"><label class="fld grow"><span>詞語語言（朗讀用）</span><select class="input" data-f="termLang">${langOpts(d.termLang)}</select></label><label class="fld grow"><span>定義語言</span><select class="input" data-f="defLang">${langOpts(d.defLang)}</select></label></div>
-    ${swRow('加入記憶複習（間隔重複）', 'srs', d.srs !== false, '開啟後，卡片會依 FSRS 演算法排程複習', 'es')}
+    <div class="panel list" style="margin:10px 0">${swRow('加入記憶複習（間隔重複）', 'srs', d.srs !== false, '開啟後，卡片會依 FSRS 演算法排程複習', 'es')}${swRow('雙向卡片', 'bidi', !!d.bidi, '同時複習「詞語→定義」與「定義→詞語」', 'eb')}</div>
     <div class="row gap wrap"><button class="btn ghost sm" data-a="import">${ic('download')} 匯入</button><button class="btn ghost sm" data-a="swapAll">${ic('swap')} 互換詞語與定義</button><span class="grow"></span><span class="muted sm" id="cnt"></span></div>
     <div id="ed-cards"></div>
     <button class="add-card" data-a="add">${ic('plus')} 新增卡片</button>
     <button class="btn primary block lg" data-a="save">${id ? '儲存變更' : '建立學習集'}</button>
   </div>`, { nav: false });
+  const moreOpen = new Set();
   function drawCards(focus) {
     $('#ed-cards').innerHTML = d.cards.map((c, i) => `<div class="ed-card">
       <div class="ed-head"><b>${i + 1}</b><div class="grow"></div><button class="icon-btn sm" data-a="up" data-i="${i}" ${i ? '' : 'disabled'} aria-label="上移">${ic('up')}</button><button class="icon-btn sm" data-a="down" data-i="${i}" ${i < d.cards.length - 1 ? '' : 'disabled'} aria-label="下移">${ic('down')}</button><button class="icon-btn sm" data-a="del" data-i="${i}" aria-label="刪除">${ic('trash')}</button></div>
@@ -626,7 +779,9 @@ function scrEdit(id) {
         <label class="ed-fld"><textarea rows="1" data-i="${i}" data-k="term" placeholder="輸入詞語">${esc(c.term)}</textarea><span>詞語</span></label>
         <label class="ed-fld"><textarea rows="1" data-i="${i}" data-k="def" placeholder="輸入定義">${esc(c.def)}</textarea><span>定義</span></label>
         <div class="ed-img">${c.img ? `<img src="${c.img}" alt=""><button class="rm" data-a="rmimg" data-i="${i}">移除</button>` : `<button class="img-btn" data-a="img" data-i="${i}">${ic('image')}<span>圖片</span></button>`}</div>
-      </div></div>`).join('');
+      </div>
+      ${c.ex || c.note || moreOpen.has(c.id) ? `<div class="ed-body ed-extra"><label class="ed-fld"><textarea rows="1" data-i="${i}" data-k="ex" placeholder="例句（會用於填空題）">${esc(c.ex || '')}</textarea><span>例句</span></label><label class="ed-fld"><textarea rows="1" data-i="${i}" data-k="note" placeholder="詞性、音標、助記…">${esc(c.note || '')}</textarea><span>備註 / 助記</span></label></div>` : `<button class="btn ghost sm ed-more" data-a="xmore" data-i="${i}">＋ 例句 / 備註</button>`}
+      </div>`).join('');
     $$('#ed-cards textarea').forEach(autoGrow);
     $('#cnt').textContent = `${d.cards.length} 張卡片`;
     if (focus != null) { const el = $(`#ed-cards textarea[data-i="${focus}"][data-k="term"]`); if (el) { el.focus(); el.scrollIntoView({ block: 'center', behavior: 'smooth' }); } }
@@ -644,7 +799,9 @@ function scrEdit(id) {
       const t = e.target;
       if (t.tagName === 'SELECT' && t.dataset.f) { d[t.dataset.f] = t.value; keep(); }
       else if (t.dataset.es) { d.srs = t.checked; keep(); }
+      else if (t.dataset.eb) { d.bidi = t.checked; keep(); }
     },
+    xmore: t => { const c = d.cards[+t.dataset.i]; moreOpen.add(c.id); drawCards(); const el = $(`#ed-cards textarea[data-i="${t.dataset.i}"][data-k="ex"]`); if (el) el.focus(); },
     $keydown: e => {
       const t = e.target;
       if (e.key === 'Tab' && !e.shiftKey && t.dataset.k === 'def' && +t.dataset.i === d.cards.length - 1) { e.preventDefault(); d.cards.push(blank()); keep(); drawCards(d.cards.length - 1); }
@@ -666,10 +823,10 @@ function scrEdit(id) {
       finish(); go(id ? '#/set/' + id : '#/library');
     },
     save: () => {
-      const cards = d.cards.map(c => ({ ...c, term: c.term.trim(), def: c.def.trim() })).filter(c => c.term || c.def || c.img);
+      const cards = d.cards.map(c => ({ ...c, term: c.term.trim(), def: c.def.trim(), ex: (c.ex || '').trim(), note: (c.note || '').trim() })).filter(c => c.term || c.def || c.img);
       if (!cards.length) return toast('請至少新增一張卡片');
       const now = Date.now();
-      const out = { ...(src || {}), id: d.id, title: d.title.trim() || '未命名學習集', desc: d.desc.trim(), termLang: d.termLang, defLang: d.defLang, srs: d.srs !== false, cards, created: src ? src.created : now, updated: now, opened: now };
+      const out = { ...(src || {}), id: d.id, title: d.title.trim() || '未命名學習集', desc: d.desc.trim(), termLang: d.termLang, defLang: d.defLang, srs: d.srs !== false, bidi: !!d.bidi, cards, created: src ? src.created : now, updated: now, opened: now };
       delete out.srcId;
       S.sets[d.id] = out;
       finish();
@@ -775,9 +932,9 @@ function modeFlashcards(set) {
     <div class="fc-ctl" id="ctl"></div></div>`, { nav: false, cls: 'full' });
   onCleanup(() => clearInterval(autoT));
 
-  const face = (c, isTerm) => {
+  const face = (c, isTerm, isBack) => {
     const txt = isTerm ? c.term : c.def;
-    return `<span class="fc-side">${isTerm ? '詞語' : '定義'}</span><div class="fc-tools"><button class="icon-btn sm" data-a="say" data-side="${isTerm ? 't' : 'd'}" aria-label="朗讀">${ic('sound')}</button><button class="icon-btn sm star ${c.star ? 'on' : ''}" data-a="star" aria-label="星號">${ic('star')}</button></div>${!isTerm && c.img ? `<img class="fc-img" src="${c.img}" alt="">` : ''}<div class="fc-text ${sz(txt)}">${txt ? fmt(txt) : '<span class="muted">（空白）</span>'}</div>`;
+    return `<span class="fc-side">${isTerm ? '詞語' : '定義'}</span><div class="fc-tools"><button class="icon-btn sm" data-a="say" data-side="${isTerm ? 't' : 'd'}" aria-label="朗讀">${ic('sound')}</button><button class="icon-btn sm star ${c.star ? 'on' : ''}" data-a="star" aria-label="星號">${ic('star')}</button></div>${!isTerm && c.img ? `<img class="fc-img" src="${c.img}" alt="">` : ''}<div class="fc-text ${sz(txt)}">${txt ? fmt(txt) : '<span class="muted">（空白）</span>'}</div>${isBack ? extraHTML(c) : ''}`;
   };
   function draw() {
     busy = false;
@@ -785,7 +942,7 @@ function modeFlashcards(set) {
     $('#fp').style.width = (deck.length ? pos / deck.length * 100 : 0) + '%';
     if (pos >= deck.length) return summary();
     const c = deck[pos], fT = o.front === 'term';
-    $('#stage').innerHTML = `<div class="fc big ${flipped ? 'flipped' : ''}" id="fc"><div class="fc-inner"><div class="face front">${face(c, fT)}</div><div class="face back">${face(c, !fT)}</div></div><div class="sw-tag l">學習中</div><div class="sw-tag r">知道</div></div>`;
+    $('#stage').innerHTML = `<div class="fc big ${flipped ? 'flipped' : ''}" id="fc"><div class="fc-inner"><div class="face front">${face(c, fT, false)}</div><div class="face back">${face(c, !fT, true)}</div></div><div class="sw-tag l">學習中</div><div class="sw-tag r">知道</div></div>`;
     const autoBtn = `<button class="icon-btn ${autoT ? 'on' : ''}" data-a="auto" aria-label="自動播放">${ic(autoT ? 'pause' : 'play')}</button>`;
     $('#ctl').innerHTML = o.track
       ? `<div class="fc-count"><span class="still"><b>${still.length}</b> 學習中</span><span class="muted">${pos + 1} / ${deck.length}</span><span class="know"><b>${know.length}</b> 知道</span></div>
@@ -890,7 +1047,7 @@ function modeFlashcards(set) {
 
 /* ---------- 學習模式 ---------- */
 function modeLearn(set) {
-  const o = S.settings.learn = Object.assign({ mc: true, wr: true, tf: false, dir: 'def', starred: false, size: 7 }, S.settings.learn || {});
+  const o = S.settings.learn = Object.assign({ mc: true, wr: true, tf: false, dir: 'def', starred: false, size: 7, cl: true }, S.settings.learn || {});
   let pool = [], prog, round = [], ri = 0, seen, roundNo = 0, cur = null, locked = false;
   function init() {
     pool = usable(set).filter(c => !o.starred || c.star);
@@ -922,8 +1079,9 @@ function modeLearn(set) {
     const c = round[ri]; seen.add(c);
     const p = prog.get(c.id), type = pickType(p);
     const dir = o.dir === 'both' ? pick(['term', 'def']) : o.dir;
-    const Q = qa(set, c, dir);
-    cur = { c, Q, type, p, lv: c.lv }; locked = false;
+    let Q = qa(set, c, dir), isCl = false;
+    if (type === 'wr' && o.cl !== false && Math.random() < 0.6) { const zq = clozeQ(c); if (zq) { Q = zq; isCl = true; } }
+    cur = { c, Q, type, p, lv: c.lv, isCl }; locked = false;
     upd();
     let body = '';
     if (type === 'mc') {
@@ -934,7 +1092,7 @@ function modeLearn(set) {
       cur.truth = Math.random() < .5 || !wrong; cur.shown = cur.truth ? Q.a : wrong;
       body = `<div class="q-sub">這個${Q.aLabel}正確嗎？</div><div class="tf-shown">${fmt(cur.shown)}</div><div class="choices two"><button class="choice" data-a="tf" data-v="1">對</button><button class="choice" data-a="tf" data-v="0">錯</button></div>`;
     } else {
-      body = `<div class="q-sub">輸入${Q.aLabel}</div><form class="wr"><input class="input lg" id="wr-in" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="輸入答案" enterkeyhint="done"><div class="row gap"><button type="button" class="btn ghost" data-a="dk">不知道？</button><button class="btn primary grow" type="submit">回答</button></div></form>`;
+      body = `<div class="q-sub">${isCl ? `提示：${esc(c.def || '—')} · ` : ''}輸入${Q.aLabel}</div><form class="wr"><input class="input lg" id="wr-in" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="輸入答案" enterkeyhint="done"><div class="row gap"><button type="button" class="btn ghost" data-a="dk">不知道？</button><button class="btn primary grow" type="submit">回答</button></div></form>`;
     }
     $('#lb').innerHTML = `<div class="q-wrap"><div class="q-card"><div class="q-label"><span>${Q.qLabel}${p > 0 ? ' · <span style="color:var(--ok)">再答對一次就精通</span>' : ''}</span><button class="icon-btn sm" data-a="sayq" aria-label="朗讀">${ic('sound')}</button></div>${Q.qImg ? `<img class="q-img" src="${Q.qImg}" alt="">` : ''}<div class="q-text ${sz(Q.q)}">${fmt(Q.q)}</div></div>${body}<div id="fb"></div></div>`;
     $('#lb').scrollTop = 0;
@@ -981,7 +1139,7 @@ function modeLearn(set) {
     pick: t => result(cur.opts[+t.dataset.i] === cur.Q.a, { chosen: +t.dataset.i }),
     tf: t => { const v = t.dataset.v === '1'; result(v === cur.truth, { chosen: v }); },
     dk: () => result(false, {}),
-    $submit: () => { if (locked || !cur || cur.type !== 'wr') return; const v = $('#wr-in').value; if (!v.trim()) return; const r = check(v, cur.Q.a); result(r.ok, { typed: v, close: r.close }); },
+    $submit: () => { if (locked || !cur || cur.type !== 'wr') return; const v = $('#wr-in').value; if (!v.trim()) return; const r = checkCl(v, cur.Q); result(r.ok, { typed: v, close: r.close }); },
     override: () => {
       const { c, p } = cur; prog.set(c.id, p + 1); c.lv = p + 1 >= 2 ? 3 : Math.max(cur.lv, 2);
       if (cur.pushed) { const k = round.lastIndexOf(c); if (k > ri) round.splice(k, 1); }
@@ -992,7 +1150,7 @@ function modeLearn(set) {
     opts: () => {
       const s = sheet(`<h3 class="sheet-title">學習選項</h3>
         <div class="group-title" style="margin-top:0">題型</div>
-        ${swRow('選擇題', 'mc', o.mc)}${swRow('是非題', 'tf', o.tf)}${swRow('填寫題', 'wr', o.wr, '需輸入答案才能精通')}
+        ${swRow('選擇題', 'mc', o.mc)}${swRow('是非題', 'tf', o.tf)}${swRow('填寫題', 'wr', o.wr, '需輸入答案才能精通')}${swRow('有例句時用例句填空', 'cl', o.cl, '把例句中的詞語挖空，輸入缺少的詞')}
         <div class="set-row"><span>作答方式</span><div class="seg">${[['def', '定義'], ['term', '詞語'], ['both', '兩者']].map(([v, l]) => `<button data-a="dir" data-v="${v}" class="${o.dir === v ? 'on' : ''}">${l}</button>`).join('')}</div></div>
         ${swRow('只學習星號詞語', 'starred', o.starred)}
         <div class="set-row"><span>每回合題數</span><select class="input sm" id="lsz">${[5, 7, 10, 15, 20].map(v => `<option ${v === o.size ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
@@ -1020,7 +1178,7 @@ function modeLearn(set) {
 
 /* ---------- 測驗模式 ---------- */
 function modeTest(set) {
-  const o = S.settings.test = Object.assign({ n: 20, dir: 'def', tf: true, mc: true, match: true, wr: true, starred: false }, S.settings.test || {});
+  const o = S.settings.test = Object.assign({ n: 20, dir: 'def', tf: true, mc: true, match: true, wr: true, starred: false, cl: true }, S.settings.test || {});
   const all = usable(set);
   if (!all.length) { toast('需要同時有詞語與定義的卡片'); return go('#/set/' + set.id); }
   const base = () => { const b = all.filter(c => !o.starred || c.star); return b.length ? b : all; };
@@ -1031,7 +1189,7 @@ function modeTest(set) {
       <div class="setup-head"><div><div class="eyebrow">${esc(set.title)}</div><h2>設定你的測驗</h2></div><span style="color:var(--primary)">${ic('test', 'xl')}</span></div>
       <div class="set-row"><span>問題數<small>最多 ${max} 題</small></span><input type="number" inputmode="numeric" class="input xs" data-t="n" min="1" max="${max}" value="${o.n}"></div>
       <div class="set-row"><span>作答方式</span><select class="input sm" data-t="dir"><option value="def" ${o.dir === 'def' ? 'selected' : ''}>定義</option><option value="term" ${o.dir === 'term' ? 'selected' : ''}>詞語</option><option value="both" ${o.dir === 'both' ? 'selected' : ''}>兩者</option></select></div>
-      ${swRow('是非題', 'tf', o.tf)}${swRow('選擇題', 'mc', o.mc)}${swRow('配對題', 'match', o.match)}${swRow('填寫題', 'wr', o.wr)}${swRow('只測驗星號詞語', 'starred', o.starred)}
+      ${swRow('是非題', 'tf', o.tf)}${swRow('選擇題', 'mc', o.mc)}${swRow('配對題', 'match', o.match)}${swRow('填寫題', 'wr', o.wr)}${swRow('填寫題有例句時改為例句填空', 'cl', o.cl)}${swRow('只測驗星號詞語', 'starred', o.starred)}
       <button class="btn primary block lg mt" data-a="start">開始測驗</button></div></div></div>`, { nav: false, cls: 'full' });
     H = {
       $change: e => {
@@ -1055,7 +1213,7 @@ function modeTest(set) {
     by.tf.forEach(c => { const d = D(), Q = qa(set, c, d); const wrong = distractors(set.cards, c, d, 1)[0]; const truth = Math.random() < .5 || !wrong; qs.push({ t: 'tf', c, Q, truth, shown: truth ? Q.a : wrong }); });
     by.mc.forEach(c => { const d = D(), Q = qa(set, c, d); qs.push({ t: 'mc', c, Q, opts: shuffle([Q.a, ...distractors(set.cards, c, d, 3)]) }); });
     for (let i = 0; i < by.match.length; i += 5) { const d = o.dir === 'both' ? 'def' : o.dir; const items = by.match.slice(i, i + 5).map(c => ({ c, Q: qa(set, c, d) })); qs.push({ t: 'match', items, opts: shuffle(items.map(x => x.Q.a)) }); }
-    by.wr.forEach(c => qs.push({ t: 'wr', c, Q: qa(set, c, D()) }));
+    by.wr.forEach(c => { const zq = o.cl !== false ? clozeQ(c) : null; qs.push(zq ? { t: 'wr', c, Q: zq, hint: c.def } : { t: 'wr', c, Q: qa(set, c, D()) }); });
     ans = qs.map(q => q.t === 'match' ? q.items.map(() => '') : null);
     t0 = Date.now();
     paper();
@@ -1077,7 +1235,7 @@ function modeTest(set) {
       h += `<div class="tq"><div class="tq-head"><span>${q.Q.qLabel}</span><span>${num} / ${total}</span></div>${q.Q.qImg ? `<img class="q-img" src="${q.Q.qImg}" alt="">` : ''}<div class="tq-q ${sz(q.Q.q)}">${fmt(q.Q.q)}</div>`;
       if (q.t === 'tf') h += `<div class="tq-shown"><small>${q.Q.aLabel}</small>${fmt(q.shown)}</div><div class="choices two"><button class="choice" data-a="tans" data-q="${i}" data-v="1">對</button><button class="choice" data-a="tans" data-q="${i}" data-v="0">錯</button></div>`;
       if (q.t === 'mc') h += `<div class="tq-sub">選擇${q.Q.aLabel}</div><div class="choices">${q.opts.map((a, k) => `<button class="choice" data-a="tans" data-q="${i}" data-v="${k}"><span class="kbd">${String.fromCharCode(65 + k)}</span><span>${fmt(a)}</span></button>`).join('')}</div>`;
-      if (q.t === 'wr') h += `<div class="tq-sub">你的答案（${q.Q.aLabel}）</div><input class="input" data-q="${i}" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="輸入答案">`;
+      if (q.t === 'wr') h += `<div class="tq-sub">${q.hint ? `提示：${esc(q.hint)} · ` : ''}你的答案（${q.Q.aLabel}）</div><input class="input" data-q="${i}" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="輸入答案">`;
       return h + '</div>';
     }).join('');
     render(`<div class="study">${studyTop(set, '測驗', `<span class="pill" style="margin-right:8px">${total} 題</span>`)}<div class="study-body scroll">${html}
@@ -1101,7 +1259,7 @@ function modeTest(set) {
       let ok = false;
       if (q.t === 'tf') ok = ans[i] != null && (ans[i] === '1') === q.truth;
       if (q.t === 'mc') ok = ans[i] != null && q.opts[+ans[i]] === q.Q.a;
-      if (q.t === 'wr') ok = check(ans[i] || '', q.Q.a).ok;
+      if (q.t === 'wr') ok = checkCl(ans[i] || '', q.Q).ok;
       if (ok) right++; up(q.c, ok);
       return ok;
     });
@@ -1313,162 +1471,256 @@ function modeGravity(set) {
   intro();
 }
 
+/* ---------- 編輯單張卡片（共用） ---------- */
+function editCardSheet(s, c, after) {
+  const sh = sheet(`<h3 class="sheet-title">編輯卡片</h3>
+    <label class="fld"><span class="muted sm">詞語</span><textarea class="input" id="ec-t" rows="2">${esc(c.term)}</textarea></label>
+    <label class="fld mt"><span class="muted sm">定義</span><textarea class="input" id="ec-d" rows="3">${esc(c.def)}</textarea></label>
+    <label class="fld mt"><span class="muted sm">例句（可用於填空題）</span><textarea class="input" id="ec-e" rows="2">${esc(c.ex || '')}</textarea></label>
+    <label class="fld mt"><span class="muted sm">備註 / 助記</span><textarea class="input" id="ec-n" rows="2">${esc(c.note || '')}</textarea></label>
+    <button class="btn primary block mt" data-a="ok">儲存</button>`, {
+    ok: (t, e, close) => {
+      c.term = $('#ec-t', sh.root).value.trim(); c.def = $('#ec-d', sh.root).value.trim();
+      c.ex = $('#ec-e', sh.root).value.trim(); c.note = $('#ec-n', sh.root).value.trim();
+      s.updated = Date.now(); save(); close(); after && after();
+    },
+  });
+}
+const extraHTML = c => (c.ex ? `<div class="fc-extra ex">${fmt(c.ex)}</div>` : '') + (c.note ? `<div class="fc-extra">${fmt(c.note)}</div>` : '');
+
 /* ---------- 記憶複習（FSRS） ---------- */
 function modeReview(scope) {
-  const st = S.settings;
+  const st = S.settings, drill = scope === 'leech';
   const sid = scope.startsWith('s:') ? scope.slice(2) : null, fid = scope.startsWith('f:') ? scope.slice(2) : null;
   if (sid && !S.sets[sid]) return go('#/library');
   if (fid && !S.folders[fid]) return go('#/library');
-  const back = sid ? '#/set/' + sid : fid ? '#/folder/' + fid : '#/';
-  const title = sid ? S.sets[sid].title : fid ? S.folders[fid].name : '所有學習集';
-  let cur = null, shown = false, front = 'term', forced = null, kind = '';
+  const back = drill ? '#/leeches' : sid ? '#/set/' + sid : fid ? '#/folder/' + fid : '#/';
+  const title = drill ? '頑固卡練習' : sid ? S.sets[sid].title : fid ? S.folders[fid].name : '所有學習集';
+  let cur = null, shown = false, front = 'term', forced = null, kind = '', mode = 'self', cl = null, graded = null, dq = null;
   const undoStack = [];
+  const MODE_NAMES = { self: '自評', type: '輸入答案', listen: '聽力拼寫' };
   render(`<div class="study">
-    <div class="study-top"><a class="icon-btn" href="${back}" aria-label="關閉">${ic('close')}</a><div class="study-title"><span class="mode-name">記憶複習</span><span class="set-name">${esc(title)}</span></div><button class="icon-btn" data-a="undo" id="undoBtn" disabled aria-label="復原">${ic('undo')}</button><button class="icon-btn" data-a="more" aria-label="更多">${ic('more')}</button></div>
+    <div class="study-top"><a class="icon-btn" href="${back}" aria-label="關閉">${ic('close')}</a><div class="study-title"><span class="mode-name">${drill ? '頑固卡練習' : '記憶複習'}</span><span class="set-name">${esc(title)}</span></div><button class="icon-btn" data-a="undo" id="undoBtn" disabled aria-label="復原">${ic('undo')}</button><button class="icon-btn" data-a="more" aria-label="更多">${ic('more')}</button></div>
     <div class="rv-counts srs-counts" id="rc"></div>
     <div class="rv-main" id="rm"></div>
     <div class="rv-foot" id="rf"></div></div>`, { nav: false, cls: 'full' });
 
   function select() {
-    const now = Date.now(), end = dayEnd(now), today = dayKey(now), p = poolFor(scope);
-    const { newLeft, revLeft } = srsLimits();
-    const ld = [], la = [], lt = [], rv = [], nw = [];
-    for (const x of p) {
-      if (x.c.bury === today) continue;
-      const q = x.c.srs;
-      if (!q || !q.state) nw.push(x);
-      else if (q.state === 2) { if (q.due < end) rv.push(x); }
-      else if (q.due <= now) ld.push(x);
-      else if (q.due <= now + 20 * MIN) la.push(x);
-      else if (q.due < end) lt.push(x);
-    }
-    const byDue = (a, b) => a.c.srs.due - b.c.srs.due;
-    ld.sort(byDue); la.sort(byDue); rv.sort(byDue);
-    const counts = { new: Math.min(nw.length, newLeft), learn: ld.length + la.length + lt.length, rev: Math.min(rv.length, revLeft) };
+    const now = Date.now();
+    if (drill) { if (!dq) dq = shuffle(poolFor('leech')); kind = 'learn'; return { r: dq[0] || null, counts: { new: 0, learn: dq.length, rev: 0 } }; }
+    const b = buckets(scope, now), { newLeft, revLeft } = srsLimits();
+    const due = x => x.c[x.key].due;
+    b.ld.sort((a, c) => due(a) - due(c)); b.la.sort((a, c) => due(a) - due(c)); b.rv.sort((a, c) => due(a) - due(c));
+    const counts = { new: Math.min(b.nw.length, newLeft), learn: b.ld.length + b.la.length + b.lt.length, rev: Math.min(b.rv.length, revLeft) };
     let r = null;
-    if (forced) { r = p.find(x => x.c === forced) || null; forced = null; }
-    if (!r && ld.length) r = ld[0];
+    if (forced) { const f = forced; forced = null; r = poolFor(scope).find(x => x.c === f.c && x.key === f.key) || null; }
+    if (!r && b.ld.length) r = b.ld[0];
     if (!r) {
-      const canR = counts.rev > 0, canN = counts.new > 0;
-      const L = logDay();
-      if (canR && canN) r = (L.new + L.rev) % 4 === 3 ? nw[0] : rv[0];
-      else if (canR) r = rv[0];
-      else if (canN) r = nw[0];
-      else if (la.length) r = la[0];
+      const canR = counts.rev > 0, canN = counts.new > 0, L = logDay();
+      if (canR && canN) r = (L.new + L.rev) % 4 === 3 ? b.nw[0] : b.rv[0];
+      else if (canR) r = b.rv[0];
+      else if (canN) r = b.nw[0];
+      else if (b.la.length) r = b.la[0];
     }
-    if (r) { const q = r.c.srs; kind = !q || !q.state ? 'new' : q.state === 2 ? 'rev' : 'learn'; }
+    if (r) { const q = r.c[r.key]; kind = !q || !q.state ? 'new' : q.state === 2 ? 'rev' : 'learn'; }
     return { r, counts };
+  }
+  function decide() {
+    const { s, c, k } = cur, want = st.srsMode || 'self', hasT = !!c.term.trim(), hasD = !!c.def.trim();
+    mode = 'self'; cl = null; front = 'term';
+    if (k === 'r') { front = 'def'; if (want !== 'self' && hasT) mode = 'type'; }
+    else if (s.bidi) { if (want === 'listen' && TTS.ok && hasT) mode = 'listen'; }
+    else {
+      front = st.srsFront === 'mix' ? pick(['term', 'def']) : st.srsFront;
+      if (want === 'type' && hasD && hasT) { front = 'def'; mode = 'type'; }
+      else if (want === 'listen' && TTS.ok && hasT) mode = 'listen';
+    }
+    if (st.srsCloze && hasT && (k === 'r' || !s.bidi)) { const z = cloze(c); if (z) { cl = z; mode = 'cloze'; front = 'def'; } }
   }
   function drawCounts(counts) {
     $('#rc').innerHTML = `<span class="cn-new ${kind === 'new' ? 'cur' : ''}">${counts.new}</span><span class="cn-learn ${kind === 'learn' ? 'cur' : ''}">${counts.learn}</span><span class="cn-rev ${kind === 'rev' ? 'cur' : ''}">${counts.rev}</span>`;
   }
+  const sayFront = slow => {
+    const { s, c } = cur;
+    if (mode === 'listen') TTS.speak(c.term, s.termLang, slow ? Math.max(0.35, st.ttsRate * 0.55) : undefined);
+    else if (front === 'term') TTS.speak(c.term, s.termLang); else TTS.speak(c.def, s.defLang);
+  };
   function show() {
     const { r, counts } = select();
-    cur = r; shown = false;
-    $('#undoBtn').disabled = !undoStack.length;
+    cur = r; shown = false; graded = null;
+    $('#undoBtn').disabled = drill || !undoStack.length;
     if (!cur) return done();
     drawCounts(counts);
-    const { s, c } = cur;
-    front = st.srsFront === 'mix' ? pick(['term', 'def']) : st.srsFront;
-    const F = front === 'term' ? { t: c.term, l: s.termLang, img: '' } : { t: c.def, l: s.defLang, img: c.img };
-    const ret = c.srs && c.srs.state === 2 ? Math.round(FSRS.retr(c.srs) * 100) : null;
-    $('#rm').innerHTML = `<div class="rv-card" data-a="reveal">
-      <div class="rv-meta"><span>${esc(s.title)}${kind === 'new' ? ' · <span style="color:var(--c-new)">新卡</span>' : ''}${ret != null ? ` · 記憶率 ${ret}%` : ''}</span><span class="row"><button class="icon-btn sm" data-a="sayF" aria-label="朗讀">${ic('sound')}</button><button class="icon-btn sm star ${c.star ? 'on' : ''}" data-a="star" aria-label="星號">${ic('star')}</button></span></div>
-      <div class="rv-front">${F.img ? `<img class="fc-img" src="${F.img}" alt="">` : ''}<div class="fc-text ${sz(F.t)}">${fmt(F.t) || '<span class="muted">（空白）</span>'}</div></div>
-      <div class="rv-back" id="rb"></div></div>`;
-    $('#rf').innerHTML = `<button class="btn primary lg block" data-a="reveal">顯示答案</button>`;
-    if (st.autoSpeak) TTS.speak(F.t, F.l);
+    const { s, c, k, key } = cur, q = c[key];
+    decide();
+    const ret = q && q.state === 2 ? Math.round(FSRS.retr(q) * 100) : null;
+    let fr, ft;
+    if (mode === 'self') {
+      const F = front === 'term' ? { t: c.term, img: '' } : { t: c.def, img: c.img };
+      fr = `<div class="rv-front">${F.img ? `<img class="fc-img" src="${F.img}" alt="">` : ''}<div class="fc-text ${sz(F.t)}">${fmt(F.t) || '<span class="muted">（空白）</span>'}</div></div>`;
+      ft = `<button class="btn primary lg block" data-a="reveal">顯示答案</button>`;
+    } else {
+      if (mode === 'type') fr = `<div class="rv-front">${c.img ? `<img class="fc-img" src="${c.img}" alt="">` : ''}<div class="fc-text ${sz(c.def)}">${fmt(c.def)}</div><div class="q-sub mt">輸入詞語</div></div>`;
+      else if (mode === 'listen') fr = `<div class="rv-front"><button class="circle big-play" data-a="sayF" aria-label="播放">${ic('sound')}</button><button class="btn ghost sm mt" data-a="slow">🐢 慢速</button><div class="q-sub mt">聽發音，輸入你聽到的單字</div></div>`;
+      else fr = `<div class="rv-front"><div class="q-sub">例句填空</div><div class="fc-text ${sz(cl.text)}">${fmt(cl.text)}</div><div class="q-sub mt">提示：${esc(c.def || '—')}</div></div>`;
+      ft = `<form class="wr"><input class="input lg" id="rv-in" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="輸入答案" enterkeyhint="done"><div class="row gap"><button type="button" class="btn ghost" data-a="dk">不知道</button><button class="btn primary grow" type="submit">檢查</button></div></form>`;
+    }
+    $('#rm').innerHTML = `<div class="rv-card" ${mode === 'self' ? 'data-a="reveal"' : ''}>
+      <div class="rv-meta"><span>${esc(s.title)}${kind === 'new' ? ' · <span style="color:var(--c-new)">新卡</span>' : ''}${k === 'r' ? ' · 反向' : ''}${ret != null ? ` · 記憶率 ${ret}%` : ''}${q && q.leech ? ' · ⚠️頑固' : ''}</span><span class="row"><button class="icon-btn sm" data-a="sayF" aria-label="朗讀">${ic('sound')}</button><button class="icon-btn sm star ${c.star ? 'on' : ''}" data-a="star" aria-label="星號">${ic('star')}</button></span></div>
+      ${fr}<div class="rv-back" id="rb"></div></div>`;
+    $('#rf').innerHTML = ft;
+    if (mode === 'listen') setTimeout(() => { if (cur === r) sayFront(); }, 250);
+    else if (mode === 'self' && st.autoSpeak) sayFront();
+    if (mode !== 'self') setTimeout(() => { const i = $('#rv-in'); if (i && cur === r) i.focus(); }, 90);
   }
-  function reveal() {
+  function reveal(info = {}) {
     if (shown || !cur) return;
     shown = true;
-    const { s, c } = cur;
-    const B = front === 'term' ? { t: c.def, l: s.defLang, img: c.img } : { t: c.term, l: s.termLang, img: '' };
-    $('#rb').innerHTML = `<hr><div class="rv-backtxt">${B.img ? `<img class="fc-img" src="${B.img}" alt="">` : ''}<div class="fc-text ${sz(B.t)}">${fmt(B.t) || '<span class="muted">（空白）</span>'}</div><button class="icon-btn sm" data-a="sayB" aria-label="朗讀">${ic('sound')}</button></div>`;
-    $('.rv-front').style.flex = '0 0 auto';
+    const { s, c, key } = cur, q = c[key];
+    let back;
+    if (mode === 'self') {
+      const B = front === 'term' ? { t: c.def, img: c.img } : { t: c.term, img: '' };
+      back = `<hr><div class="rv-backtxt">${B.img ? `<img class="fc-img" src="${B.img}" alt="">` : ''}<div class="fc-text ${sz(B.t)}">${fmt(B.t) || '<span class="muted">（空白）</span>'}</div><button class="icon-btn sm" data-a="sayB" aria-label="朗讀">${ic('sound')}</button></div>${extraHTML(c)}`;
+      if (st.autoSpeak) front === 'term' ? TTS.speak(c.def, s.defLang) : TTS.speak(c.term, s.termLang);
+    } else {
+      const fb = info.ok ? `<div class="fb ok">${ic('check')} ${info.close ? '幾乎正確（有小拼字誤差）' : pick(PRAISE)}</div>` : `<div class="fb bad">${info.typed ? '再接再厲！' : '沒關係，記住它！'}</div>${info.typed ? `<div class="ans-cmp"><div class="you"><small>你的答案</small>${fmt(info.typed)}</div></div>` : ''}`;
+      back = `<hr>${fb}<div class="rv-backtxt"><div class="fc-text ${sz(c.term)}">${fmt(c.term)}</div><button class="icon-btn sm" data-a="sayB" aria-label="朗讀">${ic('sound')}</button></div><div class="fc-text s muted">${fmt(c.def)}</div>${extraHTML(c)}`;
+      TTS.speak(c.term, s.termLang);
+    }
+    $('#rb').innerHTML = back;
+    const fr = $('.rv-front'); if (fr) fr.style.flex = '0 0 auto';
     const now = Date.now(), names = ['重來', '困難', '良好', '簡單'];
-    const pv = [1, 2, 3, 4].map(g => FSRS.next(c.srs, g, now, st).due - now);
-    $('#rf').innerHTML = `<div class="rv-btns">${[1, 2, 3, 4].map(g => `<button class="rv-b g${g}" data-a="rate" data-g="${g}"><small>${fmtIvl(pv[g - 1])}</small><b>${names[g - 1]}</b></button>`).join('')}</div>`;
-    if (st.autoSpeak) TTS.speak(B.t, B.l);
+    const pv = [1, 2, 3, 4].map(g => drill ? 0 : FSRS.next(q, g, now, st).due - now);
+    $('#rf').innerHTML = `<div class="rv-btns">${[1, 2, 3, 4].map(g => `<button class="rv-b g${g} ${graded === g ? 'sug' : ''}" data-a="rate" data-g="${g}"><small>${drill ? (g === 1 ? '再練' : '記得') : fmtIvl(pv[g - 1])}</small><b>${names[g - 1]}</b></button>`).join('')}</div>${graded ? `<div class="muted sm center" style="margin-top:6px">建議：${names[graded - 1]}（可自行調整）</div>` : ''}`;
+  }
+  function leechSheet(x) {
+    const q = x.c[x.key];
+    sheet(`<h3 class="sheet-title">⚠️ 頑固卡</h3><p>「${esc(x.c.term || x.c.def)}」已經忘記 ${q.lapses} 次。<br><span class="muted">建議幫它加上例句或助記（備註），或先暫停這張卡。</span></p>
+      <button class="btn primary block" data-a="ed">編輯卡片（加入助記）</button><button class="btn outline block" data-a="sp">暫停這張卡</button><button class="btn ghost block" data-a="ok">繼續複習</button>`, {
+      ed: (t, e, c) => { c(); editCardSheet(x.s, x.c, () => { if (cur && cur.c === x.c) show(); }); },
+      sp: (t, e, c) => { q.susp = true; save(); c(); if (cur && cur.c === x.c && cur.key === x.key) show(); toast('已暫停；可在「頑固卡」頁恢復'); },
+      ok: (t, e, c) => c(),
+    });
   }
   function rate(g) {
     if (!shown || !cur) return;
-    const { c } = cur, now = Date.now(), prev = c.srs ? { ...c.srs } : null, L = logDay();
+    const x = cur, { c, key, k, s } = x, now = Date.now();
+    if (drill) { dq.shift(); if (g === 1) dq.push(x); act(); show(); return; }
+    const prev = c[key] ? { ...c[key] } : null, L = logDay();
     const wasNew = !prev || !prev.state, wasRev = !!prev && prev.state === 2;
-    undoStack.push({ c, prev, lv: c.lv, wasNew, wasRev, g });
+    undoStack.push({ x, prev, lv: c.lv, sib: c.sib, wasNew, wasRev, g });
     if (undoStack.length > 50) undoStack.shift();
-    c.srs = FSRS.next(prev, g, now, st);
+    const nq = FSRS.next(prev, g, now, st);
+    let leech = false;
+    if (g === 1 && !nq.leech && (nq.lapses || 0) >= (st.leech || 8)) { nq.leech = true; leech = true; }
+    c[key] = nq;
+    if (!c.rl) c.rl = [];
+    c.rl.push([now, g, prev ? prev.state : 0, k === 'r' ? 1 : 0]);
+    if (c.rl.length > 200) c.rl.splice(0, c.rl.length - 200);
+    if (s.bidi) c.sib = { d: dayKey(now), k: k === 'f' ? 'r' : 'f' };
     if (wasNew) L.new++;
     if (wasRev) { L.rev++; if (g > 1) L.pass++; else L.fail++; }
-    L.n++;
-    if (g === 1) c.lv = 1; else if (c.srs.state === 2 && c.srs.ivl >= 21) c.lv = 3; else c.lv = Math.max(c.lv, 2);
+    L.n++; checkGoal();
+    if (g === 1) c.lv = 1; else if (nq.state === 2 && nq.ivl >= 21) c.lv = 3; else c.lv = Math.max(c.lv, 2);
     save(); show();
+    if (leech) leechSheet(x);
   }
   function undo() {
+    if (drill) return;
     const u = undoStack.pop(); if (!u) return;
-    const L = logDay();
-    u.c.srs = u.prev; u.c.lv = u.lv;
+    const { c, key } = u.x, L = logDay();
+    c[key] = u.prev; c.lv = u.lv; c.sib = u.sib; if (c.rl && c.rl.length) c.rl.pop();
     if (u.wasNew) L.new = Math.max(0, L.new - 1);
     if (u.wasRev) { L.rev = Math.max(0, L.rev - 1); if (u.g > 1) L.pass = Math.max(0, L.pass - 1); else L.fail = Math.max(0, L.fail - 1); }
     L.n = Math.max(0, L.n - 1);
-    save(); forced = u.c; show(); toast('已復原');
+    save(); forced = u.x; show(); toast('已復原');
   }
   function done() {
-    const p = poolFor(scope), now = Date.now(), today = dayKey(now);
+    const p = poolFor(drill ? 'leech' : scope), now = Date.now(), today = dayKey(now);
     let nextDue = Infinity, newAvail = 0;
-    for (const { c } of p) { const q = c.srs; if (!q || !q.state) { if (c.bury !== today) newAvail++; continue; } if (q.due > now) nextDue = Math.min(nextDue, q.due); }
+    for (const x of p) { const q = x.c[x.key]; if (!q || !q.state) { if (x.c.bury !== today) newAvail++; continue; } if (q.susp) continue; if (q.due > now) nextDue = Math.min(nextDue, q.due); }
     const { newLeft } = srsLimits();
     $('#rc').innerHTML = ''; $('#rf').innerHTML = '';
-    $('#rm').innerHTML = `<div class="done"><div class="cp-emoji">${p.length ? '🎉' : '📭'}</div><h2>${p.length ? '恭喜！目前沒有要複習的卡片' : '這裡還沒有卡片'}</h2>
+    $('#rm').innerHTML = drill
+      ? `<div class="done"><div class="cp-emoji">💪</div><h2>頑固卡練習完成！</h2><p class="muted">它們會繼續依 FSRS 排程出現在每日複習中。</p><a class="btn primary block mt" href="${back}">返回</a></div>`
+      : `<div class="done"><div class="cp-emoji">${p.length ? '🎉' : '📭'}</div><h2>${p.length ? '恭喜！目前沒有要複習的卡片' : '這裡還沒有可複習的卡片'}</h2>
+      ${!p.length ? '<p class="muted">請確認學習集已開啟「加入記憶複習」。</p>' : ''}
       ${nextDue < Infinity ? `<p class="muted">下一張卡片將在 <b>${fmtIvl(nextDue - now)}</b> 後到期</p>` : ''}
       ${newAvail && !newLeft ? `<p class="muted">已達今日新卡上限（${st.newPerDay} 張），還有 ${newAvail} 張新卡片。</p><button class="btn outline block" data-a="extra">${ic('plus')} 今天再多學 10 張新卡</button>` : ''}
       <a class="btn primary block mt" href="${back}">返回</a><a class="btn ghost block" href="#/stats">${ic('chart')} 查看統計</a></div>`;
   }
   H = {
-    reveal, undo,
+    reveal: () => reveal({}), undo,
     rate: t => rate(+t.dataset.g),
     extra: () => { logDay().extra = (logDay().extra || 0) + 10; save(); show(); },
     star: () => { const c = cur.c; c.star = !c.star; $('.rv-card .star').classList.toggle('on', c.star); save(); },
-    sayF: () => { const { s, c } = cur; front === 'term' ? TTS.speak(c.term, s.termLang) : TTS.speak(c.def, s.defLang); },
-    sayB: () => { const { s, c } = cur; front === 'term' ? TTS.speak(c.def, s.defLang) : TTS.speak(c.term, s.termLang); },
+    sayF: () => sayFront(), slow: () => sayFront(true),
+    sayB: () => { const { s, c } = cur; (mode === 'self' && front === 'term') ? TTS.speak(c.def, s.defLang) : TTS.speak(c.term, s.termLang); },
+    dk: () => { if (shown || !cur) return; graded = 1; reveal({ ok: false, typed: '' }); },
+    $submit: () => {
+      if (!cur || shown || mode === 'self') return;
+      const inp = $('#rv-in'); if (!inp || !inp.value.trim()) return;
+      const v = inp.value, r = checkCl(v, { a: cur.c.term, alt: cl && cl.surface });
+      graded = r.ok ? (r.close ? 2 : 3) : 1;
+      reveal({ ok: r.ok, close: r.close, typed: v });
+    },
     more: () => {
       if (!cur) return menuSheet('', [['chart', '查看統計', () => go('#/stats')], ['gear', '複習設定', () => go('#/settings')]]);
-      const { s, c } = cur;
+      const { s, c, key } = cur, q = c[key];
+      const next = { self: 'type', type: 'listen', listen: 'self' }[st.srsMode || 'self'];
       menuSheet('', [
-        ['edit', '編輯這張卡片', () => {
-          const sh = sheet(`<h3 class="sheet-title">編輯卡片</h3><label class="fld"><span class="muted sm">詞語</span><textarea class="input" id="ec-t" rows="2">${esc(c.term)}</textarea></label><label class="fld"><span class="muted sm">定義</span><textarea class="input" id="ec-d" rows="3">${esc(c.def)}</textarea></label><button class="btn primary block mt" data-a="ok">儲存</button>`, {
-            ok: (t, e, close) => { c.term = $('#ec-t', sh.root).value.trim(); c.def = $('#ec-d', sh.root).value.trim(); s.updated = Date.now(); save(); close(); forced = c; show(); },
-          });
-        }],
+        ['edit', '編輯這張卡片（例句／備註）', () => editCardSheet(s, c, () => { forced = cur; show(); })],
+        ['swap', `作答方式：${MODE_NAMES[st.srsMode || 'self']} → ${MODE_NAMES[next]}`, () => { st.srsMode = next; save(); forced = cur; show(); toast('已切換為' + MODE_NAMES[next]); }],
         ['pause2', '今天先略過這張', () => { c.bury = dayKey(); save(); show(); toast('明天會再出現'); }],
-        ['reset', '重設這張卡片為新卡', () => { c.srs = null; save(); show(); }],
+        ...(q && q.state ? [['pause2', q.susp ? '恢復這張卡' : '暫停這張卡（不再出現）', () => { q.susp = !q.susp; save(); show(); }]] : []),
+        ['reset', '重設這張卡片為新卡', () => { c[key] = null; save(); show(); }],
         ['cards', '開啟學習集', () => go('#/set/' + s.id)],
         ['gear', '複習設定', () => go('#/settings')],
       ]);
     },
     $keydown: e => {
       if (typing(e)) return;
-      if (!shown && (e.key === ' ' || e.key === 'Enter')) { e.preventDefault(); reveal(); }
+      if (!shown && mode === 'self' && (e.key === ' ' || e.key === 'Enter')) { e.preventDefault(); reveal({}); }
       else if (shown && /^[1-4]$/.test(e.key)) rate(+e.key);
-      else if (shown && (e.key === ' ' || e.key === 'Enter')) { e.preventDefault(); rate(3); }
+      else if (shown && (e.key === ' ' || e.key === 'Enter')) { e.preventDefault(); rate(graded || 3); }
       else if (e.key.toLowerCase() === 'z') undo();
     },
   };
   show();
 }
 
+/* ---------- 頑固卡 ---------- */
+function scrLeeches() {
+  const list = leechList(), active = list.filter(x => !x.c[x.key].susp).length;
+  render(`<div class="page">
+    <div class="topbar"><a class="icon-btn" href="#/" aria-label="返回">${ic('back')}</a></div>
+    <h1 class="page-title" style="margin-top:0">頑固卡</h1>
+    <p class="muted">反覆忘記達 ${S.settings.leech || 8} 次的卡片。幫它加上例句或助記，常常就能記住。</p>
+    ${active ? `<a class="btn primary block" href="#/review/leech">${ic('review')} 練習這 ${active} 張</a>` : ''}
+    <div class="terms mt">${list.map((x, i) => { const q = x.c[x.key]; return `<div class="term-row lv1" style="grid-template-columns:1fr auto"><div><div class="tr-t" style="border:0;padding:0">${fmt(x.c.term)}${x.k === 'r' ? ' <span class="pill">反向</span>' : ''}</div><div class="muted sm">${fmt(x.c.def)}</div><div class="srs-counts mt"><span class="cn-learn">忘記 ${q.lapses} 次</span>${q.susp ? '<span class="pill">已暫停</span>' : ''}<span class="pill">${esc(x.s.title)}</span></div></div><div class="row" style="flex-direction:column;gap:2px">
+      <button class="icon-btn sm" data-a="edit" data-i="${i}" aria-label="編輯">${ic('edit')}</button><button class="icon-btn sm" data-a="susp" data-i="${i}" aria-label="暫停／恢復">${ic(q.susp ? 'play' : 'pause2')}</button><button class="icon-btn sm" data-a="clear" data-i="${i}" aria-label="不再視為頑固">${ic('check')}</button><button class="icon-btn sm" data-a="reset" data-i="${i}" aria-label="重設為新卡">${ic('reset')}</button></div></div>`; }).join('') || `<div class="empty">${ic('check')}<p>目前沒有頑固卡 👍</p></div>`}</div>
+  </div>`);
+  const X = t => list[+t.dataset.i];
+  H = {
+    edit: t => { const x = X(t); editCardSheet(x.s, x.c, scrLeeches); },
+    susp: t => { const q = X(t).c[X(t).key]; q.susp = !q.susp; save(); scrLeeches(); },
+    clear: t => { const q = X(t).c[X(t).key]; q.leech = false; q.lapses = 0; save(); toast('已移出頑固卡'); scrLeeches(); },
+    reset: async t => { const x = X(t); if (await confirmDlg('把這張卡重設為新卡？', { ok: '重設' })) { x.c[x.key] = null; save(); scrLeeches(); } },
+  };
+}
+
 /* ---------- 統計 ---------- */
 function scrStats() {
   const all = poolFor('all'), now = Date.now();
   let nw = 0, lrn = 0, young = 0, mature = 0, mastered = 0;
-  for (const { c } of all) {
-    const q = c.srs;
+  for (const { c, key } of all) {
+    const q = c[key];
     if (!q || !q.state) nw++; else if (q.state !== 2) lrn++; else if (q.ivl >= 21) mature++; else young++;
     if (c.lv >= 3) mastered++;
   }
   const tot = Math.max(1, all.length);
   const ds = dayStart(now), fc = Array(7).fill(0);
-  for (const { c } of all) { const q = c.srs; if (!q || !q.state) continue; const d = Math.max(0, Math.floor((q.due - ds) / DAY)); if (d < 7) fc[d]++; }
+  for (const { c, key } of all) { const q = c[key]; if (!q || !q.state || q.susp) continue; const d = Math.max(0, Math.floor((q.due - ds) / DAY)); if (d < 7) fc[d]++; }
   const fmax = Math.max(1, ...fc);
   const weeks = 18, todayDow = new Date(now - ROLL).getDay();
   let cells = '';
@@ -1482,6 +1734,7 @@ function scrStats() {
   for (let i = 0; i < 30; i++) { const L = S.log[dayKey(now - i * DAY)]; if (L) { pass += L.pass || 0; fail += L.fail || 0; total30 += L.n || 0; if (L.n) days30++; } }
   const totalAll = Object.values(S.log).reduce((n, L) => n + (L.n || 0), 0);
   const dn = ['今天', '明天'];
+  const leeches = leechList().length;
   const seg = (v, c) => `<i style="width:${v / tot * 100}%;background:${c}"></i>`;
   render(`<div class="page">
     <div class="topbar"><a class="icon-btn" href="#/" aria-label="返回">${ic('back')}</a></div>
@@ -1492,6 +1745,7 @@ function scrStats() {
       <div class="stat"><b>${pass + fail ? Math.round(pass / (pass + fail) * 100) + '%' : '—'}</b><span>30 天複習記憶率</span></div>
       <div class="stat"><b>${totalAll}</b><span>累計作答</span></div>
     </div>
+    <a class="panel row mt" href="#/leeches" style="justify-content:space-between"><span><b>頑固卡</b> <span class="muted sm">反覆忘記的卡片</span></span><span class="pill ${leeches ? 'blue' : ''}">${leeches} 張 ›</span></a>
     <div class="sec-head"><h2>學習紀錄</h2><span class="muted sm">近 30 天學習 ${days30} 天 · ${total30} 次</span></div>
     <div class="panel"><div class="heat">${cells}</div></div>
     <div class="sec-head"><h2>未來 7 天到期</h2></div>
@@ -1510,13 +1764,32 @@ function applyTheme() {
   const dark = t === 'dark' || (t === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
   $('#tc').setAttribute('content', dark ? '#0a092d' : '#f6f7fb');
 }
+function afterReplace() { FSRS.setW(S.settings.fsrsW); applyTheme(); }
+function fsrsGroups() {
+  const g = [];
+  for (const s of Object.values(S.sets)) for (const c of s.cards) {
+    if (!c.rl || !c.rl.length) continue;
+    const f = c.rl.filter(r => !r[3]), r = c.rl.filter(r => r[3]);
+    if (f.length) g.push(f); if (r.length) g.push(r);
+  }
+  return g;
+}
 function scrSettings() {
   const st = S.settings;
   const segBtns = (a, cur, opts) => opts.map(([v, l]) => `<button data-a="${a}" data-v="${v}" class="${cur === v ? 'on' : ''}">${l}</button>`).join('');
+  const groups = fsrsGroups(), logTotal = groups.reduce((n, g) => n + g.length, 0), usableN = FSRS.replay(groups, FSRS.getW()).n;
+  const bkAge = S.meta.lastBackup ? (Date.now() - S.meta.lastBackup) / DAY : Infinity;
+  const hours = [['-1', '關閉'], ...Array.from({ length: 16 }, (_, i) => [String(i + 8), `${i + 8}:00`])];
   render(`<div class="page">
     <h1 class="page-title">設定</h1>
     <div class="group-title">外觀</div>
     <div class="panel list"><div class="set-row"><span>主題</span><div class="seg">${segBtns('theme', st.theme, [['auto', '自動'], ['light', '淺色'], ['dark', '深色']])}</div></div></div>
+
+    <div class="group-title">每日目標與提醒</div>
+    <div class="panel list">
+      <div class="set-row"><span>每日目標（作答次數）<small>設為 0 代表不使用；達成時會有慶祝動畫</small></span><input class="input xs" type="number" inputmode="numeric" min="0" max="9999" value="${st.dailyGoal}" data-s="dailyGoal"></div>
+      <div class="set-row"><span>App 內提醒時間<small>超過這個時間還沒達標，首頁會提醒你（iOS 網頁無法推播通知）</small></span><select class="input sm" data-s="remindHour">${hours.map(([v, l]) => `<option value="${v}" ${+v === st.remindHour ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+    </div>
 
     <div class="group-title">記憶複習（FSRS-5 間隔重複演算法）</div>
     <div class="panel list">
@@ -1526,7 +1799,18 @@ function scrSettings() {
       <div class="set-row"><span>學習步驟（分鐘）<small>新卡畢業前的短期步驟，以空格分隔</small></span><input class="input xs" style="width:110px" value="${st.learnSteps.join(' ')}" data-s="learnSteps"></div>
       <div class="set-row"><span>重新學習步驟（分鐘）<small>忘記後重新學習的步驟</small></span><input class="input xs" style="width:110px" value="${st.relearnSteps.join(' ')}" data-s="relearnSteps"></div>
       <div class="set-row"><span>最長間隔（天）</span><input class="input xs" type="number" inputmode="numeric" min="1" max="36500" value="${st.maxIvl}" data-s="maxIvl"></div>
-      <div class="set-row"><span>卡片正面</span><div class="seg">${segBtns('sfront', st.srsFront, [['term', '詞語'], ['def', '定義'], ['mix', '混合']])}</div></div>
+      <div class="set-row col"><span>作答方式<small>自評：看答案後自己按評分。輸入答案：看定義輸入詞語，系統會建議評分。聽力拼寫：聽發音輸入單字。</small></span><div class="seg full" style="margin:8px 0 0">${segBtns('smode', st.srsMode, [['self', '自評'], ['type', '輸入答案'], ['listen', '聽力拼寫']])}</div></div>
+      <div class="set-row"><span>卡片正面（自評）</span><div class="seg">${segBtns('sfront', st.srsFront, [['term', '詞語'], ['def', '定義'], ['mix', '混合']])}</div></div>
+      ${swRow('有例句時用填空題', 'srsCloze', st.srsCloze, '把例句挖空，輸入缺少的詞語並建議評分', 's')}
+      <div class="set-row"><span>頑固卡門檻<small>同一張卡忘記幾次後標為頑固卡</small></span><input class="input xs" type="number" inputmode="numeric" min="3" max="30" value="${st.leech}" data-s="leech"></div>
+    </div>
+
+    <div class="group-title">FSRS 參數個人化</div>
+    <div class="panel">
+      <p style="margin:0 0 6px">${st.fsrsW ? '✅ 目前使用<b>個人化參數</b>' : '目前使用<b>預設參數</b>'}</p>
+      <p class="muted sm" style="margin:0 0 12px">已累積 ${logTotal} 筆複習紀錄，其中 ${usableN} 筆可用於訓練（至少 100 筆才能執行，建議 400 筆以上）。訓練完全在手機上進行，不會上傳。</p>
+      <div class="row gap wrap"><button class="btn primary sm" data-a="opt" id="opt-btn" ${usableN < 100 ? 'disabled' : ''}>${ic('chart')} 優化參數</button>${st.fsrsW ? '<button class="btn ghost sm" data-a="optReset">恢復預設</button>' : ''}</div>
+      <p class="sm" id="opt-msg" style="margin:10px 0 0"></p>
     </div>
 
     <div class="group-title">語音朗讀</div>
@@ -1536,17 +1820,18 @@ function scrSettings() {
       <div class="set-row"><span>測試語音${TTS.ok ? '' : '<small>此瀏覽器不支援語音</small>'}</span><button class="btn ghost sm" data-a="testTts">${ic('sound')} 播放</button></div>
     </div>
 
-    <div class="group-title">資料（只儲存在這台裝置）</div>
+    <div class="group-title">資料保護（資料只儲存在這台裝置）</div>
     <div class="panel list">
-      <button class="set-row link" data-a="export"><span>${ic('download')} 匯出完整備份（JSON）</span></button>
-      <button class="set-row link" data-a="import"><span>${ic('upload')} 從備份還原 / 合併</span></button>
+      <div class="set-row"><span>上次備份<small style="${bkAge >= 7 ? 'color:var(--warn)' : ''}">${S.meta.lastBackup ? ago(S.meta.lastBackup) + (bkAge >= 7 ? '（建議現在備份）' : '') : '從未備份，建議現在備份'}</small></span><button class="btn primary sm" data-a="export">${ic('upload')} 立即備份</button></div>
+      <button class="set-row link" data-a="import"><span>${ic('download')} 從備份檔還原 / 合併</span></button>
+      <div class="set-row col"><span>自動快照<small>每天自動保留一份，最多 3 份，可在誤刪或誤覆蓋時還原（不能取代備份）</small></span><div id="snaps" class="muted sm" style="margin-top:8px">讀取中…</div></div>
       <div class="set-row"><span>儲存空間<small id="stor">計算中…</small></span></div>
       <button class="set-row link danger" data-a="wipe"><span>${ic('trash')} 清除所有資料</span></button>
     </div>
 
     <div class="group-title">安裝到 iPhone 主畫面</div>
     <div class="panel"><ol class="howto"><li>用 <b>Safari</b> 開啟這個網站</li><li>點下方工具列的「分享」按鈕</li><li>選擇「<b>加入主畫面</b>」</li><li>之後從主畫面開啟，就能全螢幕、離線使用</li></ol>
-      <p class="muted sm" style="margin-bottom:0">提醒：資料只存在此裝置的瀏覽器中（主畫面 App 與 Safari 分開儲存），請定期匯出備份。</p></div>
+      <p class="muted sm" style="margin-bottom:0">提醒：主畫面 App 與 Safari 的資料是分開儲存的，請定期備份。備份時選「儲存到檔案」並放進 iCloud Drive 最安全。</p></div>
     <p class="center muted sm" style="margin-top:24px">VocabMax · 本地優先的背單字工具</p>
   </div>`);
   const stor = $('#stor');
@@ -1555,10 +1840,17 @@ function scrSettings() {
       .then(([e, p]) => { if (stor) stor.textContent = `已使用 ${(e.usage / 1048576).toFixed(1)} MB${p ? ' · 已啟用持久儲存' : ''}`; })
       .catch(() => { if (stor) stor.textContent = '無法取得'; });
   } else stor.textContent = '無法取得';
+  let snaps = [];
+  const fdate = t => new Date(t).toLocaleString('zh-TW', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false });
+  listSnapshots().then(list => {
+    snaps = list; const el = $('#snaps'); if (!el) return;
+    el.innerHTML = list.length ? list.map((s, i) => `<div class="row gap" style="padding:4px 0"><span class="grow">${fdate(s.t)} · ${s.n} 個學習集 · ${s.c} 張卡</span><button class="btn ghost sm" data-a="snap" data-i="${i}">還原</button></div>`).join('') : '還沒有快照（開啟 App 後每天會自動建立）';
+  });
   const parseSteps = v => v.split(/[\s,]+/).map(Number).filter(x => x > 0 && isFinite(x));
   H = {
     theme: t => { st.theme = t.dataset.v; save(); applyTheme(); scrSettings(); },
     sfront: t => { st.srsFront = t.dataset.v; save(); $$('[data-a=sfront]').forEach(b => b.classList.toggle('on', b === t)); },
+    smode: t => { st.srsMode = t.dataset.v; save(); $$('[data-a=smode]').forEach(b => b.classList.toggle('on', b === t)); },
     $input: e => {
       const t = e.target;
       if (t.dataset.s === 'retention') $('#retv').textContent = t.value + '%';
@@ -1569,13 +1861,36 @@ function scrSettings() {
       if (k === 'retention') st.retention = clamp(+t.value / 100, 0.7, 0.97);
       else if (k === 'ttsRate') st.ttsRate = +t.value;
       else if (k === 'autoSpeak') st.autoSpeak = t.checked;
+      else if (k === 'srsCloze') st.srsCloze = t.checked;
       else if (k === 'learnSteps' || k === 'relearnSteps') { st[k] = parseSteps(t.value); t.value = st[k].join(' '); }
       else if (k === 'newPerDay' || k === 'maxReviews') { st[k] = clamp(parseInt(t.value) || 0, 0, 99999); t.value = st[k]; }
+      else if (k === 'dailyGoal') { st.dailyGoal = clamp(parseInt(t.value) || 0, 0, 9999); t.value = st.dailyGoal; }
+      else if (k === 'remindHour') st.remindHour = parseInt(t.value);
+      else if (k === 'leech') { st.leech = clamp(parseInt(t.value) || 8, 3, 30); t.value = st.leech; }
       else if (k === 'maxIvl') { st.maxIvl = clamp(parseInt(t.value) || 36500, 1, 36500); t.value = st.maxIvl; }
       save(); renderTabs(); toast('已儲存設定');
     },
+    opt: async () => {
+      const btn = $('#opt-btn'), msg = $('#opt-msg'); btn.disabled = true; msg.textContent = '訓練中…0%';
+      try {
+        const r = await FSRS.optimize(groups, p => { msg.textContent = `訓練中…${Math.round(p * 100)}%`; });
+        const gain = r.before - r.after;
+        if (gain > 0.0005) {
+          st.fsrsW = r.w; FSRS.setW(r.w); save();
+          msg.innerHTML = `✅ 已套用個人化參數。預測誤差（log loss）從 <b>${r.before.toFixed(3)}</b> 降到 <b>${r.after.toFixed(3)}</b>（${r.n} 筆紀錄）。之後新排程的間隔會依你的記憶特性調整。`;
+          setTimeout(scrSettings, 4000);
+        } else { msg.textContent = `預設參數已經很適合你的資料（誤差 ${r.before.toFixed(3)}），沒有改動。累積更多紀錄後再試。`; btn.disabled = false; }
+      } catch (e) { msg.textContent = '訓練失敗：' + (e.message || e); btn.disabled = false; }
+    },
+    optReset: () => { st.fsrsW = null; FSRS.setW(null); save(); toast('已恢復預設參數'); scrSettings(); },
     testTts: () => TTS.speak('Hello! 你好，這是語音測試。', 'auto'),
-    export: () => shareOrDownload(JSON.stringify(S), `vocabmax-backup-${dayKey()}.json`, 'application/json'),
+    export: async () => { if (await doBackup()) scrSettings(); },
+    snap: async t => {
+      const sn = snaps[+t.dataset.i]; if (!sn) return;
+      if (!(await confirmDlg(`還原到 ${fdate(sn.t)} 的快照？`, { ok: '還原', danger: true, sub: '目前的資料會先自動存成新快照，之後仍可還原回來。' }))) return;
+      const data = sn.data; await takeSnapshot(true);
+      S = migrate(JSON.parse(JSON.stringify(data))); S.seeded = true; await persist(); afterReplace(); toast('已還原快照'); go('#/');
+    },
     import: () => {
       const inp = document.createElement('input'); inp.type = 'file'; inp.accept = '.json,application/json';
       inp.onchange = async () => {
@@ -1584,21 +1899,22 @@ function scrSettings() {
         try { data = JSON.parse(await f.text()); if (!data || typeof data.sets !== 'object') throw 0; } catch (e) { return toast('無法讀取這個備份檔'); }
         const n = Object.keys(data.sets).length;
         sheet(`<h3 class="sheet-title">還原備份</h3><p class="muted">這個檔案包含 ${n} 個學習集。</p><button class="btn primary block" data-a="merge">合併到目前資料</button><button class="btn danger block" data-a="replace">取代目前所有資料</button>`, {
-          merge: (t, e, c) => {
+          merge: async (t, e, c) => {
+            await takeSnapshot(true);
             const d = migrate(data), map = {};
             for (const set of Object.values(d.sets)) { const nid = S.sets[set.id] ? uid() : set.id; map[set.id] = nid; set.id = nid; S.sets[nid] = set; }
             for (const fo of Object.values(d.folders)) { const nid = S.folders[fo.id] ? uid() : fo.id; S.folders[nid] = { ...fo, id: nid, setIds: fo.setIds.map(x => map[x]).filter(Boolean) }; }
             save(); c(); toast(`已合併 ${n} 個學習集`); renderTabs();
           },
-          replace: async (t, e, c) => { c(); if (!(await confirmDlg('確定取代目前所有資料？', { danger: true, ok: '取代', sub: '目前的資料會被完全覆蓋。' }))) return; S = migrate(data); S.seeded = true; await persist(); applyTheme(); toast('已還原備份'); go('#/'); },
+          replace: async (t, e, c) => { c(); if (!(await confirmDlg('確定取代目前所有資料？', { danger: true, ok: '取代', sub: '目前的資料會先自動存成快照，之後仍可在設定裡還原。' }))) return; await takeSnapshot(true); S = migrate(data); S.seeded = true; await persist(); afterReplace(); toast('已還原備份'); go('#/'); },
         });
       };
       inp.click();
     },
     wipe: async () => {
-      if (!(await confirmDlg('清除所有資料？', { danger: true, ok: '下一步', sub: '所有學習集、資料夾、進度與設定都會被刪除。' }))) return;
+      if (!(await confirmDlg('清除所有資料？', { danger: true, ok: '下一步', sub: '所有學習集、資料夾、進度、設定與自動快照都會被刪除。' }))) return;
       if (!(await confirmDlg('真的確定嗎？此動作無法復原。', { danger: true, ok: '永久清除' }))) return;
-      S = migrate(null); S.seeded = true; await persist(); applyTheme(); toast('已清除所有資料'); go('#/');
+      S = migrate(null); S.seeded = true; await persist(); try { DB.db && await DB.set('snaps', []); } catch (e) { } afterReplace(); toast('已清除所有資料'); go('#/');
     },
   };
 }
@@ -1619,7 +1935,7 @@ async function scrStudy(id, mode) {
 const routes = [
   [/^#?\/?$/, scrHome], [/^#\/library$/, scrLibrary], [/^#\/create$/, () => scrEdit(null)], [/^#\/edit\/([\w-]+)$/, scrEdit],
   [/^#\/set\/([\w-]+)$/, scrSet], [/^#\/folder\/([\w-]+)$/, scrFolder], [/^#\/s\/([\w-]+)\/(\w+)$/, scrStudy],
-  [/^#\/review$/, () => modeReview('all')], [/^#\/review\/f\/([\w-]+)$/, id => modeReview('f:' + id)],
+  [/^#\/review$/, () => modeReview('all')], [/^#\/review\/leech$/, () => modeReview('leech')], [/^#\/leeches$/, scrLeeches], [/^#\/review\/f\/([\w-]+)$/, id => modeReview('f:' + id)],
   [/^#\/stats$/, scrStats], [/^#\/settings$/, scrSettings],
 ];
 function router() {
@@ -1645,11 +1961,13 @@ function watchViewport() {
 
 (async function boot() {
   await load();
+  FSRS.setW(S.settings.fsrsW);
   if (!S.seeded) { if (!Object.keys(S.sets).length) seed(); S.seeded = true; save(); }
   applyTheme();
   matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', applyTheme);
   TTS.init();
   watchViewport();
+  setTimeout(() => takeSnapshot(), 3000);
   addEventListener('hashchange', router);
   router();
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') persist(); else if (/^#\/?$|^#\/review$/.test(location.hash || '#/')) renderTabs(); });
