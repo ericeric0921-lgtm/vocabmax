@@ -491,3 +491,134 @@ input[type=range] { width: 100%; accent-color: var(--primary); }
 .ed-more { margin: 0 16px 14px; }
 @media (max-width: 560px) { .ed-extra { grid-template-columns: 1fr; } }
 .rv-card .q-sub { margin-bottom: 0; }
+
+/* =========================================================
+   Motion（動畫細節）— 可在設定關閉，或依系統「減少動態效果」
+   ========================================================= */
+@property --p { syntax: '<number>'; inherits: false; initial-value: 0; }
+:root { --ease-out: cubic-bezier(.2, .8, .2, 1); --spring: cubic-bezier(.34, 1.56, .64, 1); }
+@keyframes pgIn { from { opacity: 0; transform: translateY(10px); } }
+@keyframes pgUp { from { opacity: 0; transform: translateY(26px) scale(.985); } }
+@keyframes rise { from { opacity: 0; transform: translateY(12px); } }
+@keyframes fadeIn { from { opacity: 0; } }
+@keyframes popIn { 0% { transform: scale(.6); opacity: 0; } 70% { transform: scale(1.06); opacity: 1; } 100% { transform: none; } }
+@keyframes pop { 50% { transform: scale(1.05); } }
+@keyframes starPop { 0% { transform: scale(1); } 40% { transform: scale(1.5) rotate(-14deg); } 100% { transform: none; } }
+@keyframes bump { 40% { transform: scale(1.22); } }
+@keyframes tabPop { 40% { transform: translateY(-4px) scale(1.18); } }
+@keyframes flicker { 0%, 100% { transform: scale(1) rotate(0); } 50% { transform: scale(1.1) rotate(-5deg); } }
+@keyframes cardIn { from { opacity: 0; transform: translateY(18px) scale(.97); } }
+@keyframes outL { to { opacity: 0; transform: translateX(-28%) rotate(-5deg); } }
+@keyframes outR { to { opacity: 0; transform: translateX(28%) rotate(5deg); } }
+@keyframes fcNext { from { transform: translateY(22px) scale(.94); opacity: .6; } }
+@keyframes fcPrev { from { transform: translateX(-60%) rotate(-8deg); opacity: 0; } }
+@keyframes ringIn { from { --p: 0; } }
+@keyframes barIn { from { transform: scaleX(0); } }
+@keyframes ping { 0% { box-shadow: 0 0 0 0 rgba(66, 85, 255, .55); } 100% { box-shadow: 0 0 0 24px rgba(66, 85, 255, 0); } }
+@keyframes glow { 0%, 100% { box-shadow: 0 0 0 0 rgba(24, 174, 121, 0); } 50% { box-shadow: 0 0 0 6px rgba(24, 174, 121, .28); } }
+@keyframes sugPulse { 0%, 100% { outline-offset: 2px; } 50% { outline-offset: 5px; } }
+@keyframes hitFlash { 0% { box-shadow: inset 0 0 0 0 rgba(255, 80, 80, 0); } 30% { box-shadow: inset 0 0 70px 12px rgba(255, 80, 80, .55); } 100% { box-shadow: inset 0 0 0 0 rgba(255, 80, 80, 0); } }
+@keyframes gradShift { 0%, 100% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } }
+
+/* 轉場 */
+#view.pg-in { animation: pgIn .32s var(--ease-out) backwards; }
+#view.pg-up > .study { animation: pgUp .34s var(--ease-out) backwards; }
+#view.pg-fade > .study { animation: fadeIn .22s ease backwards; }
+
+/* 依序浮現 */
+.pg-in :is(.tiles, .stat-row, .modes, .stat-grid) > *,
+.pg-in .terms > :nth-child(-n+12),
+.cp-list > *, .summary > *, .intro > *, .done > *, .checkpoint > * { animation: rise .42s var(--ease-out) backwards; }
+:is(.tiles, .stat-row, .modes, .stat-grid, .terms, .cp-list, .choices, .match-grid, .rv-btns, .summary, .intro, .done, .checkpoint, .study-body.scroll, .sheet) > :nth-child(2) { animation-delay: .04s; }
+:is(.tiles, .stat-row, .modes, .stat-grid, .terms, .cp-list, .choices, .match-grid, .rv-btns, .summary, .intro, .done, .checkpoint, .study-body.scroll, .sheet) > :nth-child(3) { animation-delay: .08s; }
+:is(.tiles, .stat-row, .modes, .stat-grid, .terms, .cp-list, .choices, .match-grid, .rv-btns, .summary, .intro, .done, .checkpoint, .study-body.scroll, .sheet) > :nth-child(4) { animation-delay: .12s; }
+:is(.tiles, .stat-row, .modes, .stat-grid, .terms, .cp-list, .choices, .match-grid, .rv-btns, .summary, .intro, .done, .checkpoint, .study-body.scroll, .sheet) > :nth-child(5) { animation-delay: .16s; }
+:is(.tiles, .stat-row, .modes, .stat-grid, .terms, .cp-list, .choices, .match-grid, .rv-btns, .summary, .intro, .done, .checkpoint, .study-body.scroll, .sheet) > :nth-child(6) { animation-delay: .2s; }
+:is(.tiles, .modes, .terms, .cp-list, .match-grid, .summary, .intro, .done, .checkpoint, .study-body.scroll, .sheet) > :nth-child(7) { animation-delay: .24s; }
+:is(.tiles, .modes, .terms, .cp-list, .match-grid, .summary, .done, .checkpoint, .study-body.scroll, .sheet) > :nth-child(8) { animation-delay: .28s; }
+:is(.terms, .cp-list, .match-grid, .study-body.scroll, .sheet) > :nth-child(9) { animation-delay: .32s; }
+:is(.terms, .cp-list, .match-grid, .study-body.scroll, .sheet) > :nth-child(10) { animation-delay: .36s; }
+:is(.terms, .cp-list, .match-grid, .study-body.scroll, .sheet) > :nth-child(11) { animation-delay: .4s; }
+:is(.terms, .cp-list, .match-grid, .study-body.scroll, .sheet) > :nth-child(12) { animation-delay: .44s; }
+
+/* 按壓與懸停 */
+.tile, .mode, .stat, .choice, .menu-item, .add-card, .chk { transition: transform .16s var(--ease-out), border-color .15s, background .15s, box-shadow .2s; }
+.tile:active, .mode:active, .stat:active, .choice:active:not(:disabled), .menu-item:active, .add-card:active { transform: scale(.97); }
+@media (hover: hover) { .tile:hover, .mode:hover, .stat:hover { transform: translateY(-2px); box-shadow: var(--shadow-lg); } }
+.btn { transition: background .15s, transform .14s var(--ease-out), box-shadow .2s, opacity .2s; }
+.btn.primary:active { box-shadow: 0 0 0 4px var(--primary-soft); }
+.icon-btn { transition: background .15s, transform .14s var(--ease-out), color .15s; }
+.icon-btn:active { transform: scale(.9); }
+.circle { transition: transform .14s var(--ease-out), background .15s; }
+.circle.good:active { background: var(--ok-soft); }
+.circle.bad:active { background: var(--warn-soft); }
+.rv-b { transition: transform .12s var(--ease-out), filter .15s; }
+.rv-b:active { filter: brightness(.92); }
+.input { transition: border-color .15s, box-shadow .2s; }
+.input:focus { box-shadow: 0 0 0 4px var(--primary-soft); }
+.switch::before { transition: transform .32s var(--spring); }
+.seg button { transition: background .2s, color .2s, box-shadow .2s; }
+.star .ic { transition: fill .15s; }
+.star.popping .ic { animation: starPop .45s var(--spring); }
+
+/* 底部分頁、首頁 */
+#tabbar a .ic { transition: transform .2s var(--ease-out); }
+#tabbar a:active .ic { transform: scale(.86); }
+#tabbar a.bounce .ic { animation: tabPop .42s var(--spring); }
+#tabbar .badge { animation: popIn .4s var(--spring) backwards; }
+.streak-chip .ic { animation: flicker 2.6s ease-in-out infinite; transform-origin: 50% 90%; }
+.today { background: linear-gradient(120deg, #4255ff, #7a5cff, #4255ff); background-size: 220% 220%; animation: gradShift 12s ease infinite; }
+.warnb { animation: rise .45s var(--ease-out) backwards; }
+.goal .bar.ok { animation: glow 2.2s ease-in-out 2; }
+.ring { animation: ringIn 1.1s var(--ease-out) backwards; }
+.bar i { transform-origin: left center; animation: barIn .75s var(--ease-out) backwards; }
+
+/* 彈出層、提示 */
+.sheet { transition: transform .4s cubic-bezier(.22, 1.12, .36, 1); }
+.sheet-bg { -webkit-backdrop-filter: blur(3px); backdrop-filter: blur(3px); }
+.sheet-wrap.open .sheet > * { animation: rise .32s var(--ease-out) backwards; }
+#toast { transform: translate(-50%, 20px) scale(.92); transition: opacity .2s, transform .38s var(--spring); }
+#toast.show { transform: translate(-50%, 0) scale(1); }
+
+/* 字卡 */
+.fc-wrap { position: relative; width: 100%; height: 100%; max-height: 560px; }
+.fc-under { position: absolute; inset: 0 10px; border-radius: 18px; background: var(--surface); box-shadow: var(--shadow); transform: translateY(22px) scale(.94); opacity: .6; }
+.fc.fc-in-next { animation: fcNext .32s var(--ease-out) backwards; }
+.fc.fc-in-prev { animation: fcPrev .34s var(--ease-out) backwards; }
+.fc-count .bump { animation: bump .4s var(--spring); }
+
+/* 學習、測驗 */
+.q-wrap { animation: rise .32s var(--ease-out) backwards; }
+.choices > .choice { animation: rise .32s var(--ease-out) backwards; }
+.choices > .choice.right { animation: pop .42s var(--spring); }
+.choices > .choice.wrong { animation: shake .36s; }
+.fb { animation: rise .26s var(--ease-out) backwards; }
+.ans-cmp > div { animation: rise .3s var(--ease-out) backwards; }
+.ans-cmp > div:nth-child(2) { animation-delay: .07s; }
+.cp-emoji { animation: popIn .55s var(--spring) backwards; display: inline-block; }
+.study-body.scroll > .tq.res { animation: rise .35s var(--ease-out) backwards; }
+
+/* 記憶複習 */
+.rv-card { animation: cardIn .3s var(--ease-out) backwards; }
+.rv-card.out-l { animation: outL .17s ease-in forwards; }
+.rv-card.out-r { animation: outR .17s ease-in forwards; }
+.rv-back > * { animation: rise .28s var(--ease-out) backwards; }
+.rv-btns > .rv-b { animation: rise .3s var(--ease-out) backwards; }
+.rv-btns > .rv-b.sug { animation: rise .3s var(--ease-out) backwards, sugPulse 1.3s ease-in-out .5s infinite; }
+.rv-foot { transition: opacity .15s; }
+.rv-foot.fade-out { opacity: 0; }
+.rv-counts span { transition: background .2s, color .2s; }
+
+/* 遊戲 */
+.match-grid > .tile-m { animation: popIn .38s var(--spring) backwards; }
+.match-grid > .tile-m.ok { animation: pop .3s var(--spring); }
+.match-grid > .tile-m.bad { animation: shake .35s; }
+.tile-m.sel { transform: translateY(-3px); box-shadow: 0 8px 18px rgba(66, 85, 255, .25); }
+.g-field.hit { animation: shake .4s, hitFlash .7s; }
+.big-play.ping { animation: ping .9s ease-out; }
+
+/* 減少動態效果 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001ms !important; animation-delay: 0s !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+}
+html.reduce *, html.reduce *::before, html.reduce *::after { animation-duration: .001ms !important; animation-delay: 0s !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }

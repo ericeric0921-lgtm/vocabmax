@@ -102,7 +102,7 @@ const LOGO = '<svg class="logo" viewBox="0 0 512 512"><rect width="512" height="
 /* ---------- 資料與儲存 ---------- */
 const LANGS = [['auto', '自動偵測'], ['en-US', '英文'], ['zh-TW', '中文（繁體）'], ['zh-CN', '中文（簡體）'], ['ja-JP', '日文'], ['ko-KR', '韓文'], ['fr-FR', '法文'], ['de-DE', '德文'], ['es-ES', '西班牙文'], ['it-IT', '義大利文'], ['pt-BR', '葡萄牙文'], ['ru-RU', '俄文'], ['vi-VN', '越南文'], ['th-TH', '泰文'], ['id-ID', '印尼文']];
 const langOpts = v => LANGS.map(([k, l]) => `<option value="${k}" ${k === v ? 'selected' : ''}>${l}</option>`).join('');
-const DEF_SETTINGS = { theme: 'auto', retention: 0.9, newPerDay: 20, maxReviews: 200, learnSteps: [1, 10], relearnSteps: [10], maxIvl: 36500, srsFront: 'term', ttsRate: 1, autoSpeak: false, sort: 'orig', srsMode: 'self', srsCloze: true, leech: 8, dailyGoal: 30, remindHour: -1, fsrsW: null };
+const DEF_SETTINGS = { theme: 'auto', retention: 0.9, newPerDay: 20, maxReviews: 200, learnSteps: [1, 10], relearnSteps: [10], maxIvl: 36500, srsFront: 'term', ttsRate: 1, autoSpeak: false, sort: 'orig', srsMode: 'self', srsCloze: true, leech: 8, dailyGoal: 30, remindHour: -1, fsrsW: null, motion: true };
 let S = null;
 const blank = () => ({ id: uid(), term: '', def: '', ex: '', note: '', img: '', star: false, lv: 0, srs: null });
 
@@ -173,6 +173,7 @@ function checkGoal() {
   if (g > 0 && !L.goal && L.n >= g) { L.goal = 1; celebrate(); toast(`🎯 今日目標 ${g} 次達成！`); }
 }
 function celebrate() {
+  if (!motionOK()) return;
   const colors = ['#4255ff', '#ffcd1f', '#18ae79', '#ff725b', '#a8b1ff'], box = document.createElement('div');
   box.className = 'confetti';
   for (let i = 0; i < 46; i++) {
@@ -423,19 +424,42 @@ document.addEventListener('keydown', e => {
 });
 const typing = e => /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName);
 
+let lastRenderHash = null, lastTab = '';
+const motionOK = () => !!S && S.settings.motion !== false && !matchMedia('(prefers-reduced-motion: reduce)').matches;
 function render(html, { nav = true, cls = '' } = {}) {
+  const h = location.hash || '#/', fresh = h !== lastRenderHash, full = cls.includes('full');
+  lastRenderHash = h;
   view.className = cls;
   view.innerHTML = html;
   document.body.classList.toggle('nonav', !nav);
-  document.body.classList.toggle('lock', cls.includes('full'));
+  document.body.classList.toggle('lock', full);
   renderTabs();
   window.scrollTo(0, 0);
+  if (motionOK()) {
+    if (fresh) view.classList.add(full ? 'pg-up' : 'pg-in');
+    else if (full) view.classList.add('pg-fade');
+    if (fresh) countUp(view);
+  }
 }
+/** 數字由 0 滾動到目標值：<b data-count="12" data-suffix="%"> */
+function countUp(root) {
+  $$('[data-count]', root).forEach(el => {
+    const to = +el.dataset.count, suf = el.dataset.suffix || '';
+    if (!(to > 0)) return;
+    const t0 = performance.now(), dur = Math.min(900, 380 + to * 12);
+    const f = now => { const p = Math.min(1, (now - t0) / dur), e = 1 - Math.pow(1 - p, 3); el.textContent = Math.round(to * e) + suf; if (p < 1) requestAnimationFrame(f); };
+    el.textContent = '0' + suf; requestAnimationFrame(f);
+  });
+}
+function pulse(el, cls) { if (!el) return; el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls); }
+document.addEventListener('click', e => { const s = e.target.closest('.star'); if (s && s.classList.contains('on')) pulse(s, 'popping'); });
 function renderTabs() {
   const h = location.hash || '#/';
   const due = S ? srsCounts('all').total : 0;
   const tabs = [['#/', 'home', '首頁', /^#\/?$|^#\/stats/], ['#/library', 'lib', '資料庫', /^#\/(library|set|folder|edit)/], ['#/create', 'plus', '建立', /^#\/create/], ['#/review', 'review', '複習', /^#\/review/], ['#/settings', 'gear', '設定', /^#\/settings/]];
-  tabbar.innerHTML = tabs.map(([href, icn, label, re]) => `<a href="${href}" class="${re.test(h) ? 'on' : ''} ${icn === 'plus' ? 'create' : ''}">${ic(icn)}<span>${label}</span>${icn === 'review' && due ? `<i class="badge">${due > 99 ? '99+' : due}</i>` : ''}</a>`).join('');
+  const act0 = (tabs.find(x => x[3].test(h)) || [''])[0], bounce = act0 && lastTab && act0 !== lastTab && motionOK();
+  lastTab = act0 || lastTab;
+  tabbar.innerHTML = tabs.map(([href, icn, label, re]) => `<a href="${href}" class="${re.test(h) ? 'on' : ''} ${re.test(h) && bounce ? 'bounce' : ''} ${icn === 'plus' ? 'create' : ''}">${ic(icn)}<span>${label}</span>${icn === 'review' && due ? `<i class="badge">${due > 99 ? '99+' : due}</i>` : ''}</a>`).join('');
 }
 let toastT = 0;
 function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 2200); }
@@ -561,7 +585,7 @@ function scrHome() {
   const bkHTML = needBk ? `<section class="panel warnb"><b>🛟 記得備份你的資料</b><p class="sm muted" style="margin:4px 0 10px">資料只存在這支手機裡。${S.meta.lastBackup ? `上次備份是 ${ago(S.meta.lastBackup)}。` : '你還沒有備份過。'}建議存到「檔案」或 iCloud。</p><div class="row gap"><button class="btn primary sm" data-a="bk">立即備份</button><button class="btn ghost sm" data-a="snz">3 天後再提醒</button></div></section>` : '';
   render(`<div class="page">
     ${bkHTML}
-    <header class="home-head"><div class="brand">${LOGO}<span>VocabMax</span></div><a class="streak-chip" href="#/stats" aria-label="連續學習天數">${ic('flame')}<b>${streak}</b></a></header>
+    <header class="home-head"><div class="brand">${LOGO}<span>VocabMax</span></div><a class="streak-chip" href="#/stats" aria-label="連續學習天數">${ic('flame')}<b data-count="${streak}">${streak}</b></a></header>
     <section class="panel today">
       <div class="today-main">
         <div class="eyebrow">今日記憶複習 · FSRS</div>
@@ -573,9 +597,9 @@ function scrHome() {
     ${goalHTML}
     ${leechN ? `<a class="panel row mt" href="#/leeches" style="justify-content:space-between"><span>⚠️ <b>頑固卡</b> <span class="muted sm">反覆忘記的卡片</span></span><span class="pill blue">${leechN} 張 ›</span></a>` : ''}
     <div class="stat-row">
-      <a class="stat" href="#/stats"><b>${L.n}</b><span>今日作答</span></a>
-      <a class="stat" href="#/stats"><b>${total}</b><span>總詞語</span></a>
-      <a class="stat" href="#/stats"><b>${mastered}</b><span>已精通</span></a>
+      <a class="stat" href="#/stats"><b data-count="${L.n}">${L.n}</b><span>今日作答</span></a>
+      <a class="stat" href="#/stats"><b data-count="${total}">${total}</b><span>總詞語</span></a>
+      <a class="stat" href="#/stats"><b data-count="${mastered}">${mastered}</b><span>已精通</span></a>
     </div>
     <div class="sec-head"><h2>最近的學習集</h2><a href="#/library">查看全部</a></div>
     ${sets.length ? `<div class="tiles">${sets.slice(0, 6).map(s => setTile(s)).join('')}</div>` : `<div class="empty">${ic('cards')}<p>還沒有學習集，建立第一個吧！</p><a class="btn primary" href="#/create">${ic('plus')} 建立學習集</a></div>`}
@@ -926,6 +950,7 @@ function modeFlashcards(set) {
     return true;
   };
   if (restore()) resumed = true; else build(base());
+  let enter = 'next', lastK = know.length, lastS = still.length;
   render(`<div class="study">${studyTop(set, '字卡', `<button class="icon-btn" data-a="opts" aria-label="選項">${ic('sliders')}</button>`)}
     <div class="top-prog"><div class="bar"><i id="fp"></i></div></div>
     <div class="fc-stage" id="stage"></div>
@@ -942,13 +967,17 @@ function modeFlashcards(set) {
     $('#fp').style.width = (deck.length ? pos / deck.length * 100 : 0) + '%';
     if (pos >= deck.length) return summary();
     const c = deck[pos], fT = o.front === 'term';
-    $('#stage').innerHTML = `<div class="fc big ${flipped ? 'flipped' : ''}" id="fc"><div class="fc-inner"><div class="face front">${face(c, fT, false)}</div><div class="face back">${face(c, !fT, true)}</div></div><div class="sw-tag l">學習中</div><div class="sw-tag r">知道</div></div>`;
+    const anim = motionOK() ? 'fc-in-' + enter : ''; enter = 'next';
+    $('#stage').innerHTML = `<div class="fc-wrap">${pos < deck.length - 1 ? '<div class="fc-under"></div>' : ''}<div class="fc big ${flipped ? 'flipped' : ''} ${anim}" id="fc"><div class="fc-inner"><div class="face front">${face(c, fT, false)}</div><div class="face back">${face(c, !fT, true)}</div></div><div class="sw-tag l">學習中</div><div class="sw-tag r">知道</div></div></div>`;
     const autoBtn = `<button class="icon-btn ${autoT ? 'on' : ''}" data-a="auto" aria-label="自動播放">${ic(autoT ? 'pause' : 'play')}</button>`;
     $('#ctl').innerHTML = o.track
       ? `<div class="fc-count"><span class="still"><b>${still.length}</b> 學習中</span><span class="muted">${pos + 1} / ${deck.length}</span><span class="know"><b>${know.length}</b> 知道</span></div>
          <div class="fc-btns"><button class="icon-btn" data-a="undo" ${hist.length ? '' : 'disabled'} aria-label="上一張">${ic('undo')}</button><div class="mid"><button class="circle bad" data-a="no" aria-label="學習中">${ic('close')}</button><button class="circle good" data-a="yes" aria-label="知道">${ic('check')}</button></div>${autoBtn}</div>`
       : `<div class="fc-count"><span></span><span class="muted">${pos + 1} / ${deck.length}</span><span></span></div>
          <div class="fc-btns"><button class="icon-btn ${o.shuffle ? 'on' : ''}" data-a="shuf" aria-label="隨機">${ic('shuffle')}</button><div class="mid"><button class="circle" data-a="prev" ${pos ? '' : 'disabled'} aria-label="上一張">${ic('left')}</button><button class="circle" data-a="next" aria-label="下一張">${ic('right')}</button></div>${autoBtn}</div>`;
+    if (still.length > lastS) pulse($('.fc-count .still'), 'bump');
+    if (know.length > lastK) pulse($('.fc-count .know'), 'bump');
+    lastK = know.length; lastS = still.length;
     bindSwipe($('#fc'), { tap: flip, left: () => o.track ? mark(false) : step(1, -1), right: () => o.track ? mark(true) : step(-1, 1) });
     if (S.settings.autoSpeak) speakSide(fT);
   }
@@ -973,13 +1002,13 @@ function modeFlashcards(set) {
     if (busy) return;
     const np = pos + d;
     if (np < 0) { const el = $('#fc'); if (el) el.style.transform = ''; return; }
-    fly(flyDir ?? -d, () => { pos = np; flipped = false; draw(); });
+    fly(flyDir ?? -d, () => { pos = np; flipped = false; if (d < 0) enter = 'prev'; draw(); });
   }
   function undo() {
     if (busy || !hist.length) return;
     const h = hist.pop(); h.c.lv = h.lv;
     if (h.k === true) know.pop(); else if (h.k === false) still.pop();
-    pos--; flipped = false; draw();
+    pos--; flipped = false; enter = 'prev'; draw();
   }
   function stopAuto() { clearInterval(autoT); autoT = 0; }
   function toggleAuto() {
@@ -997,7 +1026,7 @@ function modeFlashcards(set) {
     $('#ctl').innerHTML = '';
     $('#stage').innerHTML = o.track ? `<div class="summary">
         <h2>${still.length ? '做得好！繼續加油 💪' : '太棒了！你全部都知道 🎉'}</h2>
-        <div class="sum-grid"><div class="ring" style="--p:${pct}"><span>${pct}%</span></div><div class="sum-legend"><div class="know">知道　${know.length}</div><div class="still">學習中　${still.length}</div><div class="muted">略過　${total - know.length - still.length}</div></div></div>
+        <div class="sum-grid"><div class="ring" style="--p:${pct}"><span data-count="${pct}" data-suffix="%">${pct}%</span></div><div class="sum-legend"><div class="know">知道　${know.length}</div><div class="still">學習中　${still.length}</div><div class="muted">略過　${total - know.length - still.length}</div></div></div>
         ${still.length ? `<button class="btn primary lg block" data-a="again">繼續複習 ${still.length} 個學習中的詞語</button>` : ''}
         <a class="btn outline block" href="#/s/${set.id}/learn">用「學習」模式練習</a>
         <button class="btn ghost block" data-a="restart">重新開始字卡</button>
@@ -1276,7 +1305,7 @@ function modeTest(set) {
       return rrow(q.Q, ans[i] || '', res[i], '', res[i] ? ans[i] : null);
     }).join('');
     render(`<div class="study">${studyTop(set, '測驗結果')}<div class="study-body scroll">
-      <div class="panel result-head"><div class="ring big" style="--p:${pct}"><span>${pct}%</span></div><div><h2>${pct >= 90 ? '太厲害了！🎉' : pct >= 70 ? '做得不錯！' : '繼續努力，你會進步的！'}</h2><div class="res-meta"><span class="ok-t">答對 ${right}</span><span class="bad-t">答錯 ${total - right}</span><span class="muted">${Math.floor(secs / 60)} 分 ${secs % 60} 秒</span></div></div></div>
+      <div class="panel result-head"><div class="ring big" style="--p:${pct}"><span data-count="${pct}" data-suffix="%">${pct}%</span></div><div><h2>${pct >= 90 ? '太厲害了！🎉' : pct >= 70 ? '做得不錯！' : '繼續努力，你會進步的！'}</h2><div class="res-meta"><span class="ok-t">答對 ${right}</span><span class="bad-t">答錯 ${total - right}</span><span class="muted">${Math.floor(secs / 60)} 分 ${secs % 60} 秒</span></div></div></div>
       <div class="row gap"><button class="btn primary grow" data-a="retake">再測一次</button><button class="btn outline grow" data-a="setup">更改設定</button></div>
       ${right < total ? `<a class="btn ghost block mt" href="#/s/${set.id}/learn">用「學習」練習答錯的詞語</a>` : ''}
       <div class="tsec">你的答案</div>${rows}</div></div>`, { nav: false, cls: 'full' });
@@ -1343,7 +1372,7 @@ function modeSpell(set) {
   let q = shuffle(cards), done = 0, cur = null, locked = false, wrongN = 0;
   const total = cards.length;
   render(`<div class="study">${studyTop(set, '拼寫')}<div class="top-prog"><div class="bar ok"><i id="lp"></i></div><span id="lpt"></span></div><div class="learn-body" id="sb"></div></div>`, { nav: false, cls: 'full' });
-  const play = slow => cur && TTS.speak(cur.term, set.termLang, slow ? Math.max(0.35, S.settings.ttsRate * 0.55) : undefined);
+  const play = slow => { if (!cur) return; pulse($('.big-play'), 'ping'); TTS.speak(cur.term, set.termLang, slow ? Math.max(0.35, S.settings.ttsRate * 0.55) : undefined); };
   function ask() {
     $('#lp').style.width = done / total * 100 + '%'; $('#lpt').textContent = `${done} / ${total}`;
     if (!q.length) return fin();
@@ -1435,7 +1464,7 @@ function modeGravity(set) {
     raf = requestAnimationFrame(loop);
   }
   function hit() {
-    paused = true; miss = true; lives--; ast.c.lv = 1; save(); hud();
+    paused = true; miss = true; lives--; ast.c.lv = 1; save(); hud(); pulse($('#gf'), 'hit');
     queue.splice(Math.min(2, queue.length), 0, ast.c);
     const m = $('#gm'); m.classList.remove('hidden');
     m.innerHTML = `<div>${fmt(ast.Q.q)}<b>${fmt(ast.Q.a)}</b><span class="muted">輸入正確答案以繼續</span></div>`;
@@ -1602,6 +1631,12 @@ function modeReview(scope) {
       ok: (t, e, c) => c(),
     });
   }
+  const exitCard = (g, then) => {
+    const el = $('.rv-card');
+    if (!el || !motionOK()) return then();
+    el.classList.add(g === 1 ? 'out-l' : 'out-r'); $('#rf').classList.add('fade-out');
+    later(() => { const f = $('#rf'); if (f) f.classList.remove('fade-out'); then(); }, 170);
+  };
   function rate(g) {
     if (!shown || !cur) return;
     const x = cur, { c, key, k, s } = x, now = Date.now();
@@ -1622,8 +1657,8 @@ function modeReview(scope) {
     if (wasRev) { L.rev++; if (g > 1) L.pass++; else L.fail++; }
     L.n++; checkGoal();
     if (g === 1) c.lv = 1; else if (nq.state === 2 && nq.ivl >= 21) c.lv = 3; else c.lv = Math.max(c.lv, 2);
-    save(); show();
-    if (leech) leechSheet(x);
+    save(); shown = false;
+    exitCard(g, () => { show(); if (leech) leechSheet(x); });
   }
   function undo() {
     if (drill) return;
@@ -1740,10 +1775,10 @@ function scrStats() {
     <div class="topbar"><a class="icon-btn" href="#/" aria-label="返回">${ic('back')}</a></div>
     <h1 class="page-title" style="margin-top:0">學習統計</h1>
     <div class="stat-grid">
-      <div class="stat"><b style="color:var(--warn)">🔥 ${calcStreak()}</b><span>連續天數</span></div>
-      <div class="stat"><b>${logDay().n}</b><span>今日作答</span></div>
+      <div class="stat"><b style="color:var(--warn)">🔥 <span data-count="${calcStreak()}">${calcStreak()}</span></b><span>連續天數</span></div>
+      <div class="stat"><b data-count="${logDay().n}">${logDay().n}</b><span>今日作答</span></div>
       <div class="stat"><b>${pass + fail ? Math.round(pass / (pass + fail) * 100) + '%' : '—'}</b><span>30 天複習記憶率</span></div>
-      <div class="stat"><b>${totalAll}</b><span>累計作答</span></div>
+      <div class="stat"><b data-count="${totalAll}">${totalAll}</b><span>累計作答</span></div>
     </div>
     <a class="panel row mt" href="#/leeches" style="justify-content:space-between"><span><b>頑固卡</b> <span class="muted sm">反覆忘記的卡片</span></span><span class="pill ${leeches ? 'blue' : ''}">${leeches} 張 ›</span></a>
     <div class="sec-head"><h2>學習紀錄</h2><span class="muted sm">近 30 天學習 ${days30} 天 · ${total30} 次</span></div>
@@ -1763,6 +1798,7 @@ function applyTheme() {
   if (t === 'auto') delete root.dataset.theme; else root.dataset.theme = t;
   const dark = t === 'dark' || (t === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
   $('#tc').setAttribute('content', dark ? '#0a092d' : '#f6f7fb');
+  root.classList.toggle('reduce', S.settings.motion === false);
 }
 function afterReplace() { FSRS.setW(S.settings.fsrsW); applyTheme(); }
 function fsrsGroups() {
@@ -1783,7 +1819,7 @@ function scrSettings() {
   render(`<div class="page">
     <h1 class="page-title">設定</h1>
     <div class="group-title">外觀</div>
-    <div class="panel list"><div class="set-row"><span>主題</span><div class="seg">${segBtns('theme', st.theme, [['auto', '自動'], ['light', '淺色'], ['dark', '深色']])}</div></div></div>
+    <div class="panel list"><div class="set-row"><span>主題</span><div class="seg">${segBtns('theme', st.theme, [['auto', '自動'], ['light', '淺色'], ['dark', '深色']])}</div></div>${swRow('動畫效果', 'motion', st.motion !== false, '轉場、翻卡與回饋動畫；關閉可減少畫面動態', 's')}</div>
 
     <div class="group-title">每日目標與提醒</div>
     <div class="panel list">
@@ -1862,6 +1898,7 @@ function scrSettings() {
       else if (k === 'ttsRate') st.ttsRate = +t.value;
       else if (k === 'autoSpeak') st.autoSpeak = t.checked;
       else if (k === 'srsCloze') st.srsCloze = t.checked;
+      else if (k === 'motion') { st.motion = t.checked; applyTheme(); }
       else if (k === 'learnSteps' || k === 'relearnSteps') { st[k] = parseSteps(t.value); t.value = st[k].join(' '); }
       else if (k === 'newPerDay' || k === 'maxReviews') { st[k] = clamp(parseInt(t.value) || 0, 0, 99999); t.value = st[k]; }
       else if (k === 'dailyGoal') { st.dailyGoal = clamp(parseInt(t.value) || 0, 0, 9999); t.value = st.dailyGoal; }
